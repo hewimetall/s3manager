@@ -122,11 +122,10 @@ def test_create_s3_client_assume_role(mocker):
     client = module._create_s3_client_from_role(role)
     assert client is s3_client_mock
     sts_client.assume_role.assert_called_once()
-    # Check that create_client was called with correct arguments
-    botocore_session_mock.create_client.assert_called_once()
-    call_kwargs = botocore_session_mock.create_client.call_args[1]
-    assert call_kwargs["endpoint_url"] == "http://minio:9000"
-    assert call_kwargs["use_ssl"] is False
+    # The assumed-role S3 client is built via boto3.Session(...).client("s3", ...);
+    # client_side_effect captured its kwargs.
+    assert captured_kwargs["endpoint_url"] == "http://minio:9000"
+    assert captured_kwargs["use_ssl"] is False
 
 
 def test_create_s3_client_assume_role_with_datetime_expiration(mocker):
@@ -186,6 +185,50 @@ def test_create_s3_client_assume_role_with_datetime_expiration(mocker):
     assert isinstance(expiry_time, str), f"expiry_time should be string, got {type(expiry_time)}"
     # Should be ISO format string
     assert "T" in expiry_time or "+" in expiry_time or "Z" in expiry_time
+
+
+def test_assume_role_client_is_boto3_with_transfer_methods(mocker):
+    """Regression: an assume_role S3 client must be a boto3 client so it carries
+    boto3's injected transfer methods (upload_fileobj / download_fileobj).
+
+    Streaming upload (upload_fileobj_for_role -> do_put) calls
+    client.upload_fileobj(); a bare botocore client has no such attribute and
+    raised `AttributeError: 'S3' object has no attribute 'upload_fileobj'` in
+    production for every assume_role upload. Only STS is mocked here — the S3
+    client is built for real (client construction is offline).
+    """
+    from datetime import datetime, timedelta, timezone
+
+    module = reload_s3_client()
+
+    sts_client = mocker.MagicMock()
+    sts_client.assume_role.return_value = {
+        "Credentials": {
+            "AccessKeyId": "AKIAEXAMPLE",
+            "SecretAccessKey": "secret",
+            "SessionToken": "token",
+            "Expiration": datetime.now(timezone.utc) + timedelta(hours=1),
+        }
+    }
+    sts_session = mocker.MagicMock()
+    sts_session.client.return_value = sts_client
+    # Mock ONLY the STS session; BotocoreSession + the real S3 client build run.
+    mocker.patch("another_s3_manager.s3_client._new_boto3_session", return_value=sts_session)
+
+    client = module._create_s3_client_from_role(
+        {
+            "type": "assume_role",
+            "role_arn": "arn:aws:iam::123456789012:role/Static-Content",
+            "region": "eu-central-1",
+        }
+    )
+
+    # boto3 injects these onto its S3 client; a low-level botocore client does not.
+    assert hasattr(client, "upload_fileobj"), (
+        "assume_role client must be a boto3 client (has upload_fileobj); a bare botocore client breaks streaming upload"
+    )
+    assert hasattr(client, "download_fileobj")
+    sts_client.assume_role.assert_called_once()
 
 
 def test_create_s3_client_credentials(mocker):
@@ -472,9 +515,12 @@ def test_assume_role_retries_once_on_expired_credentials(mocker):
         CredentialRetrievalError(provider="x", error_msg="token expired"),
         {"Credentials": creds},
     ]
-    _mock_session_client(mocker, return_value=sts)
     fake_client = mocker.Mock()
-    mocker.patch.object(s3_client.BotocoreSession, "create_client", return_value=fake_client)
+
+    def client_side_effect(service_name, **kwargs):
+        return sts if service_name == "sts" else fake_client
+
+    _mock_session_client(mocker, side_effect=client_side_effect)
     clear = mocker.patch.object(s3_client, "_clear_boto3_cached_credentials")
 
     role = {"name": "r", "type": "assume_role", "role_arn": "arn:aws:iam::000000000000:role/x"}
@@ -521,15 +567,22 @@ def test_assume_role_refreshes_via_refreshable_credentials(mocker):
     }
     sts = mocker.Mock()
     sts.assume_role.side_effect = [{"Credentials": first}, {"Credentials": second}]
-    _mock_session_client(mocker, return_value=sts)
 
     captured = {}
+    s3_mock = mocker.Mock()
 
-    def capture(self, *a, **k):
-        captured["session"] = self
-        return mocker.Mock()
+    def fake_session(*args, **kwargs):
+        # STS build: boto3.Session().client("sts") -> sts mock.
+        # S3 build: boto3.Session(botocore_session=<real session>).client("s3").
+        sess = mocker.MagicMock()
+        if "botocore_session" in kwargs:
+            captured["session"] = kwargs["botocore_session"]
+            sess.client.return_value = s3_mock
+        else:
+            sess.client.return_value = sts
+        return sess
 
-    mocker.patch.object(s3_client.BotocoreSession, "create_client", capture)
+    mocker.patch("boto3.Session", side_effect=fake_session)
 
     role = {"name": "r", "type": "assume_role", "role_arn": "arn:aws:iam::000000000000:role/x"}
     s3_client._create_s3_client_from_role(role)
@@ -568,15 +621,22 @@ def test_assume_role_metrics_attribute_initial_and_refresh_to_separate_counters(
     }
     sts = mocker.Mock()
     sts.assume_role.side_effect = [{"Credentials": first}, {"Credentials": second}]
-    _mock_session_client(mocker, return_value=sts)
 
     captured = {}
+    s3_mock = mocker.Mock()
 
-    def capture(self, *a, **k):
-        captured["session"] = self
-        return mocker.Mock()
+    def fake_session(*args, **kwargs):
+        # STS build: boto3.Session().client("sts") -> sts mock.
+        # S3 build: boto3.Session(botocore_session=<real session>).client("s3").
+        sess = mocker.MagicMock()
+        if "botocore_session" in kwargs:
+            captured["session"] = kwargs["botocore_session"]
+            sess.client.return_value = s3_mock
+        else:
+            sess.client.return_value = sts
+        return sess
 
-    mocker.patch.object(s3_client.BotocoreSession, "create_client", capture)
+    mocker.patch("boto3.Session", side_effect=fake_session)
 
     role = {"name": "r", "type": "assume_role", "role_arn": "arn:aws:iam::000000000000:role/x"}
     assume_labels = {"role": "r", "result": "ok"}
@@ -628,14 +688,16 @@ def test_assume_role_sts_region_falls_back_to_aws_region_env(mocker, monkeypatch
     sts = mocker.Mock()
     sts.assume_role.return_value = {"Credentials": creds}
     boto_client = _mock_session_client(mocker, return_value=sts)
-    create_client = mocker.patch.object(s3_client.BotocoreSession, "create_client", return_value=mocker.Mock())
 
     role = {"name": "r", "type": "assume_role", "role_arn": "arn:aws:iam::000000000000:role/x"}
     s3_client._create_s3_client_from_role(role)
 
-    assert boto_client.call_args.kwargs["region_name"] == "eu-central-1"
+    # STS build and the assumed-role S3 build both go through the patched
+    # boto3.Session().client(...); split them by service name.
+    calls = {c.args[0]: c.kwargs for c in boto_client.call_args_list}
+    assert calls["sts"]["region_name"] == "eu-central-1"
     # The assumed-role S3 client inherits the same region.
-    assert create_client.call_args.kwargs["region_name"] == "eu-central-1"
+    assert calls["s3"]["region_name"] == "eu-central-1"
 
 
 def test_assume_role_role_region_beats_aws_region_env(mocker, monkeypatch):
@@ -681,13 +743,13 @@ def test_assume_role_region_none_without_any_source(mocker, monkeypatch):
     sts = mocker.Mock()
     sts.assume_role.return_value = {"Credentials": creds}
     boto_client = _mock_session_client(mocker, return_value=sts)
-    create_client = mocker.patch.object(s3_client.BotocoreSession, "create_client", return_value=mocker.Mock())
 
     role = {"name": "r", "type": "assume_role", "role_arn": "arn:aws:iam::000000000000:role/x"}
     s3_client._create_s3_client_from_role(role)
 
-    assert boto_client.call_args.kwargs["region_name"] is None
-    assert "region_name" not in create_client.call_args.kwargs
+    calls = {c.args[0]: c.kwargs for c in boto_client.call_args_list}
+    assert calls["sts"]["region_name"] is None
+    assert "region_name" not in calls["s3"]
 
 
 def test_create_s3_client_s3_compatible_path_style_backward_compat(mocker):
