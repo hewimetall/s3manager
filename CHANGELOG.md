@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.5] - 2026-07-30
+
+### Fixed
+
+- **`assume_role` uploads crashed with `AttributeError: 'S3' object has no
+attribute 'upload_fileobj'`.** The streaming upload path calls
+  `client.upload_fileobj()`, a transfer method boto3 injects onto its S3
+  client. Every role type built a boto3 client except the `assume_role` +
+  refreshable-credentials path, which used `botocore_session.create_client()`
+  and returned a bare botocore client lacking that method — so every upload
+  through an assume_role role failed (regression introduced with streaming
+  uploads). The client is now built via `boto3.Session(botocore_session=...)`,
+  which carries boto3's transfer methods while preserving the auto-refreshing
+  credentials. Download and copy were unaffected.
+
+### Changed
+
+- Grafana dashboard (`docs/grafana-dashboard.json`) legends now sort by their
+  most meaningful column (Total / Max / Mean / Last) instead of alphabetically,
+  so a height-clipped legend shows the top contributors first.
+
 ## [1.1.4] - 2026-07-15
 
 ### Fixed
@@ -642,7 +663,8 @@ in _s3_clients_cache` before indexing into it — two separate,
 - CSRF protection
 - Login attempt rate limiting
 
-[Unreleased]: https://github.com/kruchenburger/another-s3-manager/compare/v1.1.4...HEAD
+[Unreleased]: https://github.com/kruchenburger/another-s3-manager/compare/v1.1.5...HEAD
+[1.1.5]: https://github.com/kruchenburger/another-s3-manager/compare/v1.1.4...v1.1.5
 [1.1.4]: https://github.com/kruchenburger/another-s3-manager/compare/v1.1.3...v1.1.4
 [1.1.3]: https://github.com/kruchenburger/another-s3-manager/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/kruchenburger/another-s3-manager/compare/v1.1.1...v1.1.2
