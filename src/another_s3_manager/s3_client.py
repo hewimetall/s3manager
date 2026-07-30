@@ -504,7 +504,13 @@ def _create_s3_client_from_role(role: Dict[str, Any]) -> AnyType:
             client_kwargs["endpoint_url"] = endpoint_url
 
         logger.info(f"Creating S3 client with auto-refreshable assumed role credentials for {role_arn}")
-        return botocore_session.create_client("s3", **client_kwargs)
+        # Wrap the botocore session in a boto3 Session so the returned client
+        # carries boto3's injected transfer methods (upload_fileobj /
+        # download_fileobj / managed copy). A bare botocore client from
+        # `create_client` lacks them, which broke streaming upload
+        # (upload_fileobj_for_role) for every assume_role role. The refreshable
+        # credentials live on `botocore_session._credentials` and are preserved.
+        return boto3.Session(botocore_session=botocore_session).client("s3", **client_kwargs)
 
     elif role_type == "credentials":
         access_key_id = role.get("access_key_id")
