@@ -4,7 +4,12 @@ import logging
 
 import pytest
 
-from another_s3_manager.logging_setup import HANDLER_NAME, configure_logging
+from another_s3_manager.logging_setup import (
+    HANDLER_NAME,
+    _AccessLogPathFilter,
+    configure_logging,
+    install_access_log_filter,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -149,3 +154,89 @@ def test_alembic_upgrade_does_not_silence_the_app(monkeypatch, tmp_path):
     root = logging.getLogger()
     assert any(h.name == HANDLER_NAME for h in root.handlers), "our root handler was replaced by alembic.ini's"
     assert root.level == logging.INFO, "root's level was overwritten by alembic.ini's"
+
+
+# --- access-log path filter -------------------------------------------------
+
+
+def _access_record(path: str, status: int, method: str = "GET") -> logging.LogRecord:
+    """A LogRecord shaped exactly like uvicorn.access emits: positional args
+    (client_addr, method, full_path, http_version, status_code)."""
+    return logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname="",
+        lineno=0,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=("10.0.0.1:1234", method, path, "1.1", status),
+        exc_info=None,
+    )
+
+
+@pytest.fixture
+def _clean_access_logger():
+    """Snapshot/restore uvicorn.access's filters around a test."""
+    access = logging.getLogger("uvicorn.access")
+    saved = list(access.filters)
+    yield access
+    access.filters = saved
+
+
+@pytest.mark.parametrize("path", ["/", "/health", "/metrics"])
+def test_access_filter_drops_successful_noise_paths(path):
+    f = _AccessLogPathFilter({"/", "/health", "/metrics"})
+    assert f.filter(_access_record(path, 200)) is False
+    assert f.filter(_access_record(path, 204)) is False
+
+
+def test_access_filter_keeps_real_paths_and_errors():
+    f = _AccessLogPathFilter({"/", "/health", "/metrics"})
+    # Real API traffic is always kept.
+    assert f.filter(_access_record("/api/buckets?role=X", 200)) is True
+    assert f.filter(_access_record("/favicon.ico", 200)) is True
+    # A failure on a noise path is kept — the filter hides noise, not problems.
+    assert f.filter(_access_record("/", 500)) is True
+    assert f.filter(_access_record("/metrics", 503)) is True
+    # The query string is stripped before matching the excluded path.
+    assert f.filter(_access_record("/metrics?foo=bar", 200)) is False
+
+
+def test_access_filter_ignores_non_uvicorn_records():
+    f = _AccessLogPathFilter({"/"})
+    rec = logging.LogRecord("uvicorn.access", logging.INFO, "", 0, "plain message", None, None)
+    assert f.filter(rec) is True
+
+
+def test_install_access_filter_default_drops_root(monkeypatch, _clean_access_logger):
+    monkeypatch.delenv("ACCESS_LOG_EXCLUDE_PATHS", raising=False)
+    install_access_log_filter()
+    installed = [f for f in _clean_access_logger.filters if isinstance(f, _AccessLogPathFilter)]
+    assert len(installed) == 1
+    assert installed[0].filter(_access_record("/", 200)) is False
+    assert installed[0].filter(_access_record("/metrics", 200)) is False
+    assert installed[0].filter(_access_record("/api/me", 200)) is True
+
+
+def test_install_access_filter_empty_disables(monkeypatch, _clean_access_logger):
+    monkeypatch.setenv("ACCESS_LOG_EXCLUDE_PATHS", "")
+    install_access_log_filter()
+    installed = [f for f in _clean_access_logger.filters if isinstance(f, _AccessLogPathFilter)]
+    assert installed == []
+
+
+def test_install_access_filter_custom_paths(monkeypatch, _clean_access_logger):
+    monkeypatch.setenv("ACCESS_LOG_EXCLUDE_PATHS", "/foo, /bar")
+    install_access_log_filter()
+    f = [f for f in _clean_access_logger.filters if isinstance(f, _AccessLogPathFilter)][0]
+    assert f.filter(_access_record("/foo", 200)) is False
+    assert f.filter(_access_record("/bar", 200)) is False
+    # Defaults no longer apply once the env overrides the set.
+    assert f.filter(_access_record("/metrics", 200)) is True
+
+
+def test_install_access_filter_idempotent(monkeypatch, _clean_access_logger):
+    monkeypatch.delenv("ACCESS_LOG_EXCLUDE_PATHS", raising=False)
+    install_access_log_filter()
+    install_access_log_filter()
+    installed = [f for f in _clean_access_logger.filters if isinstance(f, _AccessLogPathFilter)]
+    assert len(installed) == 1

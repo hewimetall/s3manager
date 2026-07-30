@@ -3,7 +3,7 @@ Another S3 Manager - Lightweight S3 file management interface
 Provides file browsing, upload, and deletion capabilities for S3 buckets
 """
 
-from another_s3_manager.logging_setup import configure_logging
+from another_s3_manager.logging_setup import configure_logging, install_access_log_filter
 
 configure_logging()
 
@@ -199,6 +199,11 @@ def run_startup_tasks() -> None:
     scenarios untestable through the lifespan itself. This function has no such
     limit and is idempotent — running it N times is exactly N restarts.
     """
+    # 0. Quiet uvicorn access-log noise (health / uptime-monitor / scrape paths).
+    #    Installed here, inside startup, so uvicorn has already configured its
+    #    `uvicorn.access` logger by the time we attach the filter.
+    install_access_log_filter()
+
     # 1. DB migrations — must complete before any request hits a model
     try:
         _run_alembic_upgrade()

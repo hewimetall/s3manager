@@ -100,23 +100,24 @@ supported up to `max_file_size` (S3's per-object maximum is 5 TB). The MCP
 
 ## Environment Variables
 
-| Variable                          | Description                                                                                                                                                   | Default              |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| `JWT_SECRET_KEY`                  | **Required.** Secret for JWT tokens                                                                                                                           | —                    |
-| `ADMIN_PASSWORD`                  | Admin password — seeds the admin on first boot and re-applies on change, until the password is set from the UI or CLI (see [Authentication](#authentication)) | `change_me_pls`      |
-| `ADMIN_PASSWORD_FORCE`            | One-shot override: `1`/`true`/`yes` makes the next start apply `ADMIN_PASSWORD` even over a UI- or CLI-set password. Remove it afterwards                     | unset                |
-| `PORT`                            | Server port                                                                                                                                                   | `8080`               |
-| `AWS_REGION`                      | Default AWS region                                                                                                                                            | from env             |
-| `DATA_DIR`                        | Directory for SQLite DB and runtime data                                                                                                                      | `/app/data`          |
-| `MAX_FILE_SIZE`                   | Max upload size in bytes                                                                                                                                      | `104857600` (100 MB) |
-| `DISABLE_DELETION`                | Disable delete operations                                                                                                                                     | `false`              |
-| `COOKIE_SECURE`                   | Auth cookie `Secure` flag — set to `false` for local HTTP, `true` for HTTPS prod                                                                              | `true`               |
-| `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` | Session lifetime in minutes                                                                                                                                   | `180`                |
-| `PRESIGNED_URL_DEFAULT_TTL`       | Default share-link lifetime in seconds                                                                                                                        | `3600`               |
-| `PRESIGNED_URL_MAX_TTL`           | Max share-link lifetime in seconds (7-day SigV4 ceiling)                                                                                                      | `604800`             |
-| `ENABLE_LAZY_LOADING`             | Lazy loading for large file lists                                                                                                                             | `true`               |
-| `LOG_FORMAT`                      | Log output: `text` or `json` (for log aggregators)                                                                                                            | `text`               |
-| `METRICS_PASSWORD`                | Basic-auth password for `/metrics` (endpoint is open if unset)                                                                                                | —                    |
+| Variable                          | Description                                                                                                                                                      | Default              |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| `JWT_SECRET_KEY`                  | **Required.** Secret for JWT tokens                                                                                                                              | —                    |
+| `ADMIN_PASSWORD`                  | Admin password — seeds the admin on first boot and re-applies on change, until the password is set from the UI or CLI (see [Authentication](#authentication))    | `change_me_pls`      |
+| `ADMIN_PASSWORD_FORCE`            | One-shot override: `1`/`true`/`yes` makes the next start apply `ADMIN_PASSWORD` even over a UI- or CLI-set password. Remove it afterwards                        | unset                |
+| `PORT`                            | Server port                                                                                                                                                      | `8080`               |
+| `AWS_REGION`                      | Default AWS region                                                                                                                                               | from env             |
+| `DATA_DIR`                        | Directory for SQLite DB and runtime data                                                                                                                         | `/app/data`          |
+| `MAX_FILE_SIZE`                   | Max upload size in bytes                                                                                                                                         | `104857600` (100 MB) |
+| `DISABLE_DELETION`                | Disable delete operations                                                                                                                                        | `false`              |
+| `COOKIE_SECURE`                   | Auth cookie `Secure` flag — set to `false` for local HTTP, `true` for HTTPS prod                                                                                 | `true`               |
+| `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` | Session lifetime in minutes                                                                                                                                      | `180`                |
+| `PRESIGNED_URL_DEFAULT_TTL`       | Default share-link lifetime in seconds                                                                                                                           | `3600`               |
+| `PRESIGNED_URL_MAX_TTL`           | Max share-link lifetime in seconds (7-day SigV4 ceiling)                                                                                                         | `604800`             |
+| `ENABLE_LAZY_LOADING`             | Lazy loading for large file lists                                                                                                                                | `true`               |
+| `LOG_FORMAT`                      | Log output: `text` or `json` (for log aggregators)                                                                                                               | `text`               |
+| `ACCESS_LOG_EXCLUDE_PATHS`        | Comma-separated paths whose successful (status < 400) access logs are dropped — silences health-check / uptime-monitor / Prometheus-scrape noise. Empty logs all | `/,/health,/metrics` |
+| `METRICS_PASSWORD`                | Basic-auth password for `/metrics` (endpoint is open if unset)                                                                                                   | —                    |
 
 ## Authentication
 
