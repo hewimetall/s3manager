@@ -198,6 +198,13 @@ Set `LOG_FORMAT=json` for structured one-line-per-event JSON logs (for Loki,
 CloudWatch, and other aggregators). The default `text` format is human-readable
 and meant for `docker logs` / local development.
 
+By default the `uvicorn.access` log drops successful (status < 400) requests to
+`/`, `/health`, and `/metrics` — otherwise liveness/uptime probes and the
+Prometheus scrape flood the log with a line every few seconds. Override the set
+with `ACCESS_LOG_EXCLUDE_PATHS` (comma-separated); set it empty to log every
+request. Failed requests (status >= 400) to those paths are always logged, so a
+failing health check or a `/metrics` outage is still visible.
+
 ## Health check
 
 `GET /health` returns `{"status": "ok", "version": "<semver>"}` — used by the

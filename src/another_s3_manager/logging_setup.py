@@ -68,3 +68,56 @@ def configure_logging() -> None:
 
     for name in _QUIET_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
+
+
+# Default paths whose successful access-log lines are pure infrastructure noise:
+# the SPA/health root that load balancers and uptime monitors poll, the app's
+# health endpoint, and the Prometheus scrape target. Overridable via env.
+_DEFAULT_ACCESS_LOG_EXCLUDE = "/,/health,/metrics"
+
+
+class _AccessLogPathFilter(logging.Filter):
+    """Drop uvicorn access-log records for successful requests to noisy paths.
+
+    uvicorn emits each access line via `uvicorn.access` with positional args
+    `(client_addr, method, full_path, http_version, status_code)`. This filter
+    suppresses a record only when the request path is in the exclude set AND the
+    response was successful (status < 400) — a failing health check or a 5xx on
+    `/` still gets logged, so the filter hides noise without hiding problems.
+    Records whose args don't match uvicorn's shape are always kept.
+    """
+
+    def __init__(self, exclude_paths: set[str]) -> None:
+        super().__init__()
+        self._exclude = exclude_paths
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if not isinstance(args, tuple) or len(args) < 5:
+            return True
+        full_path, status_code = args[2], args[4]
+        try:
+            status = int(status_code)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return True
+        if status >= 400:
+            return True
+        path = str(full_path).split("?", 1)[0]
+        return path not in self._exclude
+
+
+def install_access_log_filter() -> None:
+    """Attach the access-log path filter to uvicorn's `uvicorn.access` logger.
+
+    Reads `ACCESS_LOG_EXCLUDE_PATHS` (comma-separated; default
+    `/,/health,/metrics`). An empty value disables filtering entirely. Idempotent
+    — repeat calls (e.g. test-driven restarts) replace, never stack, the filter.
+    Call this at startup, after uvicorn has configured its access logger.
+    """
+    raw = os.getenv("ACCESS_LOG_EXCLUDE_PATHS", _DEFAULT_ACCESS_LOG_EXCLUDE)
+    exclude = {p.strip() for p in raw.split(",") if p.strip()}
+
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.filters = [f for f in access_logger.filters if not isinstance(f, _AccessLogPathFilter)]
+    if exclude:
+        access_logger.addFilter(_AccessLogPathFilter(exclude))
