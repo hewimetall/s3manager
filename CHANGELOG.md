@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.6] - 2026-07-31
+
+### Changed
+
+- Access log now suppresses successful health-check and monitoring noise.
+  `uvicorn.access` no longer logs requests to `/`, `/health`, and `/metrics`
+  that return a status below 400, so uptime-monitor polling and Prometheus
+  scrapes stop drowning out real activity. Configurable via the new
+  `ACCESS_LOG_EXCLUDE_PATHS` env var (comma-separated; default
+  `/,/health,/metrics`; empty value disables filtering). Errors (status >= 400)
+  are always logged, and non-excluded traffic is untouched.
+
 ## [1.1.5] - 2026-07-30
 
 ### Fixed
@@ -663,7 +675,8 @@ in _s3_clients_cache` before indexing into it — two separate,
 - CSRF protection
 - Login attempt rate limiting
 
-[Unreleased]: https://github.com/kruchenburger/another-s3-manager/compare/v1.1.5...HEAD
+[Unreleased]: https://github.com/kruchenburger/another-s3-manager/compare/v1.1.6...HEAD
+[1.1.6]: https://github.com/kruchenburger/another-s3-manager/compare/v1.1.5...v1.1.6
 [1.1.5]: https://github.com/kruchenburger/another-s3-manager/compare/v1.1.4...v1.1.5
 [1.1.4]: https://github.com/kruchenburger/another-s3-manager/compare/v1.1.3...v1.1.4
 [1.1.3]: https://github.com/kruchenburger/another-s3-manager/compare/v1.1.2...v1.1.3
