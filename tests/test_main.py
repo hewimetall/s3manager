@@ -361,6 +361,43 @@ def test_get_current_user_info_requires_auth(app_client):
     assert response.status_code == status.HTTP_401_UNAUTHORIZED
 
 
+def test_me_bootstraps_session_from_trusted_header(app_client):
+    """A gateway-authenticated request with no app cookie should get a local
+    session minted from the forwarded username and reuse it on the next call."""
+    create_user("alice", password="alicepass", is_admin=False)
+
+    response = app_client.get("/api/me", headers={"x-authentik-username": "alice"})
+    assert response.status_code == status.HTTP_200_OK, response.text
+    assert response.json()["username"] == "alice"
+    assert "access_token=" in response.headers.get("set-cookie", "")
+
+    # TestClient stores the new cookie automatically, so the next request no
+    # longer needs the trusted header.
+    follow_up = app_client.get("/api/me")
+    assert follow_up.status_code == status.HTTP_200_OK
+    assert follow_up.json()["username"] == "alice"
+
+
+def test_me_trusted_header_requires_provisioned_local_user(app_client):
+    """The forwarded identity must map onto an existing s3manager row; fail
+    closed rather than auto-creating users with unknown roles."""
+    response = app_client.get("/api/me", headers={"x-authentik-username": "ghost"})
+    assert response.status_code == status.HTTP_403_FORBIDDEN
+    assert "not provisioned" in response.json()["detail"]
+    assert "access_token=" not in response.headers.get("set-cookie", "")
+
+
+def test_me_keeps_existing_local_session_over_trusted_header(app_client):
+    """A deliberate local login (e.g. admin) must not be silently overwritten
+    by the gateway username on the next /api/me poll."""
+    create_user("alice", password="alicepass", is_admin=False)
+    login(app_client, username="admin", password="admin123")
+
+    response = app_client.get("/api/me", headers={"x-authentik-username": "alice"})
+    assert response.status_code == status.HTTP_200_OK
+    assert response.json()["username"] == "admin"
+
+
 def test_get_app_info(app_client):
     response = app_client.get("/api/app-info")
     assert response.status_code == status.HTTP_200_OK

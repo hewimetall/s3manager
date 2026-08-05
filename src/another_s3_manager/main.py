@@ -48,13 +48,13 @@ import another_s3_manager.config as config_module
 from another_s3_manager.api_tokens import count_active_tokens
 from another_s3_manager.auth import (
     check_ban,
-    create_access_token,
-    generate_csrf_token,
+    get_trusted_username,
     get_current_admin_user,
     get_current_user,
     get_jwt_secret_key,
     has_valid_session,
     hash_password,
+    issue_session_cookie,
     record_login_attempt,
     verify_csrf_token,
     verify_password,
@@ -673,6 +673,101 @@ def _enforce_password_policy(password: str) -> None:
         )
 
 
+async def _maybe_issue_trusted_header_session(request: Request, response: Response) -> Optional[Dict[str, Any]]:
+    """Fail-closed SSO bridge for gateway-authenticated requests with no valid
+    app session yet.
+
+    This path trusts the forwarded identity only to BOOTSTRAP the first
+    s3manager session after authentik login. Once an app session exists, it
+    stays authoritative so a deliberate local admin login is not silently
+    overwritten by the gateway user's header on the next /api/me poll.
+    """
+    username = get_trusted_username(request)
+    if username is None:
+        return None
+
+    if await run_in_threadpool(check_ban, username):
+        bans = await run_in_threadpool(load_bans)
+        banned_until = bans.get(username, {}).get("banned_until", 0)
+        remaining = int((banned_until - time.time()) / 60)
+        auth_logins_total.labels(result="banned").inc()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Account is banned. Try again in {remaining} minutes.",
+        )
+
+    user = await run_in_threadpool(get_user_by_username, username)
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Authenticated upstream user '{username}' is not provisioned in s3manager",
+        )
+
+    user["csrf_token"] = issue_session_cookie(response, username)
+    auth_logins_total.labels(result="trusted_header").inc()
+    logger.info("Issued trusted-header session for username=%s", username)
+    return user
+
+
+async def _resolve_current_user_for_me(request: Request, response: Response) -> Dict[str, Any]:
+    """Resolve /api/me against an existing app session first, then the trusted
+    gateway header if the local session is absent or unusable."""
+    try:
+        return await run_in_threadpool(get_current_user, request)
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_401_UNAUTHORIZED:
+            raise
+        trusted_user = await _maybe_issue_trusted_header_session(request, response)
+        if trusted_user is not None:
+            return trusted_user
+        raise exc
+
+
+def _serialize_current_user_info(current_user: Dict[str, Any]) -> Dict[str, Any]:
+    """Render the /api/me payload from the canonical user dict."""
+    is_admin = current_user.get("is_admin", False)
+    config = load_config()
+    # Admins can access every role in the config — surface the full list so the
+    # React sidebar matches admin permissions without an extra /api/config call.
+    if is_admin:
+        allowed_roles = [r["name"] for r in config.get("roles", []) if r.get("name")]
+    else:
+        allowed_roles = current_user.get("allowed_roles", [])
+    # disable_deletion: env var OR config (env wins). Mirrors the same combined
+    # check used in /api/config so the two endpoints don't disagree.
+    disable_deletion_env = os.getenv("DISABLE_DELETION", "").lower() == "true"
+    disable_deletion_config = config.get("disable_deletion", False)
+    disable_deletion = disable_deletion_env or disable_deletion_config
+    # Computed default_role: explicit choice if still valid, else first of
+    # allowed_roles, else null. Helper lives in users.py so the rule lives
+    # next to the data layer that stores explicit_default.
+    from another_s3_manager.users import compute_default_role
+
+    default_role = compute_default_role(current_user.get("default_role"), allowed_roles)
+    # max_file_size: surface to client so it can validate sizes BEFORE the
+    # multipart POST and show a useful error per file. Without this, the
+    # browser uploads up to the limit, the backend rejects with 400, and the
+    # user sees a generic toast that doesn't say "this file is N MB, limit is M".
+    max_file_size_from_config = config.get("max_file_size")
+    if max_file_size_from_config is None:
+        max_file_size = int(os.getenv("MAX_FILE_SIZE", str(100 * 1024 * 1024)))
+    else:
+        max_file_size = int(max_file_size_from_config)
+    return {
+        "username": current_user.get("username"),
+        "is_admin": is_admin,
+        "csrf_token": current_user.get("csrf_token"),  # Return CSRF token for client
+        "theme": current_user.get("theme", "auto"),  # Return user's theme preference
+        "allowed_roles": allowed_roles,
+        "default_role": default_role,
+        "must_change_password": bool(current_user.get("must_change_password", False)),
+        "disable_deletion": disable_deletion,
+        "max_file_size": max_file_size,
+        "app_name": APP_NAME,  # Return app name for client
+        "app_version": APP_VERSION,
+    }
+
+
 # ============================================================================
 # Routes
 # ============================================================================
@@ -734,23 +829,7 @@ async def login(
         # Successful login
         record_login_attempt(username, True)
         auth_logins_total.labels(result="success").inc()
-
-        # Generate CSRF token and embed in the signed JWT (defence-in-depth).
-        # The JWT itself is delivered as an httpOnly cookie so JS cannot read it;
-        # the CSRF token is exposed via /api/me for the client to echo back in
-        # the X-CSRF-Token header on mutating requests.
-        csrf_token = generate_csrf_token()
-        access_token = create_access_token(data={"sub": username, "csrf_token": csrf_token})
-
-        response.set_cookie(
-            key="access_token",
-            value=access_token,
-            httponly=True,
-            secure=COOKIE_SECURE,
-            samesite="strict",
-            max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
-            path="/",
-        )
+        issue_session_cookie(response, username)
 
         return {"user": {"username": username, "is_admin": user.get("is_admin", False)}}
     except HTTPException:
@@ -774,49 +853,11 @@ async def logout(response: Response):
 
 
 @app.get("/api/me")
-async def get_current_user_info(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Get current user information"""
-    is_admin = current_user.get("is_admin", False)
-    config = load_config()
-    # Admins can access every role in the config — surface the full list so the
-    # React sidebar matches admin permissions without an extra /api/config call.
-    if is_admin:
-        allowed_roles = [r["name"] for r in config.get("roles", []) if r.get("name")]
-    else:
-        allowed_roles = current_user.get("allowed_roles", [])
-    # disable_deletion: env var OR config (env wins). Mirrors the same combined
-    # check used in /api/config so the two endpoints don't disagree.
-    disable_deletion_env = os.getenv("DISABLE_DELETION", "").lower() == "true"
-    disable_deletion_config = config.get("disable_deletion", False)
-    disable_deletion = disable_deletion_env or disable_deletion_config
-    # Computed default_role: explicit choice if still valid, else first of
-    # allowed_roles, else null. Helper lives in users.py so the rule lives
-    # next to the data layer that stores explicit_default.
-    from another_s3_manager.users import compute_default_role
-
-    default_role = compute_default_role(current_user.get("default_role"), allowed_roles)
-    # max_file_size: surface to client so it can validate sizes BEFORE the
-    # multipart POST and show a useful error per file. Without this, the
-    # browser uploads up to the limit, the backend rejects with 400, and the
-    # user sees a generic toast that doesn't say "this file is N MB, limit is M".
-    max_file_size_from_config = config.get("max_file_size")
-    if max_file_size_from_config is None:
-        max_file_size = int(os.getenv("MAX_FILE_SIZE", str(100 * 1024 * 1024)))
-    else:
-        max_file_size = int(max_file_size_from_config)
-    return {
-        "username": current_user.get("username"),
-        "is_admin": is_admin,
-        "csrf_token": current_user.get("csrf_token"),  # Return CSRF token for client
-        "theme": current_user.get("theme", "auto"),  # Return user's theme preference
-        "allowed_roles": allowed_roles,
-        "default_role": default_role,
-        "must_change_password": bool(current_user.get("must_change_password", False)),
-        "disable_deletion": disable_deletion,
-        "max_file_size": max_file_size,
-        "app_name": APP_NAME,  # Return app name for client
-        "app_version": APP_VERSION,
-    }
+async def get_current_user_info(request: Request, response: Response):
+    """Get current user information, auto-bootstrapping the first local session
+    from the trusted gateway header when appropriate."""
+    current_user = await _resolve_current_user_for_me(request, response)
+    return _serialize_current_user_info(current_user)
 
 
 @app.get("/api/app-info")

@@ -9,13 +9,14 @@ import time
 from datetime import UTC, datetime, timedelta
 from typing import Any, Dict, Optional
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, Response, status
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 
 from another_s3_manager.constants import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
     BAN_DURATION_MINUTES,
+    COOKIE_SECURE,
     JWT_ALGORITHM,
     MAX_LOGIN_ATTEMPTS,
 )
@@ -31,6 +32,11 @@ except Exception as e:
 
 # Login attempts tracking (in-memory, resets on restart)
 _login_attempts: Dict[str, Dict[str, Any]] = {}
+
+# kgateway/Envoy normalize upstream header names to lower-case before FastAPI
+# sees them. Keep the app's trust anchor in the same form so the trusted-header
+# path can never drift onto a casing that is impossible to receive.
+TRUSTED_USERNAME_HEADER = "x-authentik-username"
 
 
 def get_jwt_secret_key() -> str:
@@ -99,6 +105,32 @@ def create_access_token(data: Dict[str, Any], expires_delta: Optional[timedelta]
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, get_jwt_secret_key(), algorithm=JWT_ALGORITHM)
     return encoded_jwt
+
+
+def issue_session_cookie(response: Response, username: str) -> str:
+    """Mint a JWT session for `username`, attach it as an httpOnly cookie, and
+    return the CSRF token embedded in the JWT."""
+    csrf_token = generate_csrf_token()
+    access_token = create_access_token(data={"sub": username, "csrf_token": csrf_token})
+    response.set_cookie(
+        key="access_token",
+        value=access_token,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite="strict",
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        path="/",
+    )
+    return csrf_token
+
+
+def get_trusted_username(request: Request) -> Optional[str]:
+    """Return the forwarded authentik username, if present and non-empty."""
+    username = request.headers.get(TRUSTED_USERNAME_HEADER)
+    if username is None:
+        return None
+    username = username.strip()
+    return username or None
 
 
 def _decode_session_payload(request: Request) -> Optional[Dict[str, Any]]:
