@@ -887,16 +887,32 @@ def _make_user(is_admin=False, allowed_roles=None):
 # --- validate_role_access ---
 
 
-def test_validate_role_access_none_returns_none():
+def test_validate_role_access_none_resolves_user_default_role():
     import another_s3_manager.s3_client as mod
 
-    assert mod.validate_role_access(None, _make_user()) is None
+    user = _make_user(allowed_roles=["RoleA", "RoleB"])
+    user["default_role"] = "RoleB"
+
+    assert mod.validate_role_access(None, user) == "RoleB"
+
+
+def test_validate_role_access_none_without_roles_raises_permission_error():
+    import another_s3_manager.s3_client as mod
+
+    with pytest.raises(PermissionError, match="allowed roles"):
+        mod.validate_role_access(None, _make_user())
 
 
 def test_validate_role_access_admin_allows_any():
     import another_s3_manager.s3_client as mod
 
     assert mod.validate_role_access("AnyRole", _make_user(is_admin=True)) == "AnyRole"
+
+
+def test_validate_role_access_admin_none_stays_none():
+    import another_s3_manager.s3_client as mod
+
+    assert mod.validate_role_access(None, _make_user(is_admin=True)) is None
 
 
 def test_validate_role_access_allowed_role():
@@ -963,6 +979,25 @@ def test_validate_bucket_access_denied_role(mocker):
     )
     with pytest.raises(PermissionError):
         mod._validate_bucket_access("RoleA", "bucket", _make_user(allowed_roles=[]))
+
+
+def test_validate_bucket_access_omitted_role_uses_default_and_denies_foreign_bucket(mocker):
+    import another_s3_manager.s3_client as mod
+
+    mocker.patch(
+        "another_s3_manager.config.load_config",
+        return_value={
+            "roles": [
+                {"name": "timeweb", "type": "default", "allowed_buckets": ["shared-bucket"]},
+                {"name": "owner-role", "type": "default", "allowed_buckets": ["own-bucket"]},
+            ]
+        },
+    )
+    user = _make_user(allowed_roles=["owner-role"])
+    user["default_role"] = "owner-role"
+
+    with pytest.raises(PermissionError, match="shared-bucket"):
+        mod._validate_bucket_access(None, "shared-bucket", user)
 
 
 # --- list_buckets_for_role ---

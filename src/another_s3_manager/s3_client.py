@@ -929,20 +929,33 @@ def validate_role_access(role_name: Optional[str], user_dict: Dict[str, Any]) ->
     Raises PermissionError (not HTTPException) — callers translate to the
     appropriate boundary error (HTTP 403 or McpError).
 
-    Returns the validated role name, or None if role_name is None.
+    When `role_name` is omitted for a non-admin user, resolve it to that user's
+    effective default role (explicit `default_role` if still allowed, else the
+    first allowed role). This keeps the S3 client selection and bucket-access
+    checks tied to one of the caller's allowed roles instead of falling through
+    to the process-wide default credentials.
+
+    Returns the validated role name, or None only for an admin request that
+    omitted `role_name`.
     """
-    if role_name is None:
-        return None
+    resolved_role = role_name
 
     # Admins have access to all roles.
     if user_dict.get("is_admin", False):
-        return role_name
+        return resolved_role
 
     allowed_roles = user_dict.get("allowed_roles", [])
-    if role_name not in allowed_roles:
-        raise PermissionError(f"Access denied: You don't have permission to use role '{role_name}'")
+    if resolved_role is None:
+        from another_s3_manager.users import compute_default_role
 
-    return role_name
+        resolved_role = compute_default_role(user_dict.get("default_role"), allowed_roles)
+        if resolved_role is None:
+            raise PermissionError("Access denied: You don't have any allowed roles")
+
+    if resolved_role not in allowed_roles:
+        raise PermissionError(f"Access denied: You don't have permission to use role '{resolved_role}'")
+
+    return resolved_role
 
 
 def _validate_bucket_access(role: str, bucket: str, user_dict: Dict[str, Any]) -> None:
@@ -953,20 +966,20 @@ def _validate_bucket_access(role: str, bucket: str, user_dict: Dict[str, Any]) -
     is not in the role's allowed_buckets (when that list is configured).
     """
     # Role-level check (raises PermissionError if not allowed).
-    validate_role_access(role, user_dict)
+    validated_role = validate_role_access(role, user_dict)
 
     # Bucket-level check.
     from another_s3_manager.config import load_config
 
     config = load_config(force_reload=False)
     roles = config.get("roles", [])
-    role_config = next((r for r in roles if r.get("name") == role), None)
+    role_config = next((r for r in roles if r.get("name") == validated_role), None)
     if role_config is None:
         # Role not found in config — s3_client.get_s3_client will raise ValueError later.
         return
     allowed_buckets = role_config.get("allowed_buckets")
     if allowed_buckets and bucket not in allowed_buckets:
-        raise PermissionError(f"bucket '{bucket}' not in allowed_buckets for role '{role}'")
+        raise PermissionError(f"bucket '{bucket}' not in allowed_buckets for role '{validated_role}'")
 
 
 # Role types that sign with temporary (STS) credentials — a presigned URL
