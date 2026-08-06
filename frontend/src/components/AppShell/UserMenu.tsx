@@ -1,6 +1,6 @@
 import { Avatar, Menu, Text, UnstyledButton, Group } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import { Key, KeyRound, LogOut, Shield } from "lucide-react";
+import { LogOut, Shield } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { useMe } from "@/features/auth/hooks/useMe";
 import { useLogout } from "@/features/auth/hooks/useLogout";
@@ -16,7 +16,10 @@ export function UserMenu() {
 
   const handleLogout = (): void => {
     logout.mutate(undefined, {
-      onSuccess: () => navigate("/login", { replace: true }),
+      onSuccess: () => {
+        // Local app session is gone; gateway/authentik session may remain.
+        window.location.href = "https://auth.mcpwork.space/if/flow/default-invalidation-flow/";
+      },
       onError: () =>
         notifications.show({
           color: "red",
@@ -44,22 +47,10 @@ export function UserMenu() {
       </Menu.Target>
       <Menu.Dropdown>
         <Menu.Label>Signed in as {me.username}</Menu.Label>
-        <Menu.Item
-          leftSection={<KeyRound size={14} />}
-          onClick={() => navigate("/change-password")}
-        >
-          Change password
-        </Menu.Item>
-        <Menu.Item
-          leftSection={<Key size={14} />}
-          onClick={() => navigate("/api-tokens")}
-        >
-          MCP tokens
-        </Menu.Item>
         {me.is_admin && (
           <Menu.Item
             leftSection={<Shield size={14} />}
-            onClick={() => navigate("/admin/users")}
+            onClick={() => navigate("/admin/roles")}
           >
             Admin Console
           </Menu.Item>

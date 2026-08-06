@@ -1,5 +1,5 @@
 import { NavLink, Stack, Text } from "@mantine/core";
-import { ArrowLeft, Ban, Drama, Key, Settings, Users } from "lucide-react";
+import { ArrowLeft, Drama, Settings } from "lucide-react";
 import { useLocation, useNavigate } from "react-router-dom";
 
 interface NavItem {
@@ -7,12 +7,6 @@ interface NavItem {
   to: string;
   icon: React.ReactNode;
 }
-
-const accountsItems: NavItem[] = [
-  { label: "Users", to: "/admin/users", icon: <Users size={16} /> },
-  { label: "Bans", to: "/admin/bans", icon: <Ban size={16} /> },
-  { label: "MCP Tokens", to: "/admin/api-tokens", icon: <Key size={16} /> },
-];
 
 const infrastructureItems: NavItem[] = [
   { label: "Roles", to: "/admin/roles", icon: <Drama size={16} /> },
@@ -43,8 +37,6 @@ export function AdminSidebar() {
 
   return (
     <Stack gap={2} h="100%">
-      <SectionHeader>Accounts</SectionHeader>
-      {accountsItems.map(renderItem)}
       <SectionHeader>Infrastructure</SectionHeader>
       {infrastructureItems.map(renderItem)}
       <Stack flex={1} />

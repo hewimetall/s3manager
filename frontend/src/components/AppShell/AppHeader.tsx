@@ -84,7 +84,7 @@ export function AppHeader({ navOpened, onNavToggle }: AppHeaderProps) {
               variant="subtle"
               color="gray"
               size="lg"
-              onClick={() => navigate("/admin/users")}
+              onClick={() => navigate("/admin/roles")}
               aria-label="Open admin console"
             >
               <Shield size={18} />

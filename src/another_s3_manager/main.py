@@ -45,29 +45,19 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 import another_s3_manager.config as config_module
-from another_s3_manager.api_tokens import count_active_tokens
 from another_s3_manager.auth import (
-    check_ban,
-    get_trusted_username,
     get_current_admin_user,
     get_current_user,
     get_jwt_secret_key,
     has_valid_session,
-    hash_password,
     issue_session_cookie,
-    record_login_attempt,
     verify_csrf_token,
-    verify_password,
 )
 from another_s3_manager.config import load_config, resolve_max_file_size, resolve_presigned_ttls, save_config
 from another_s3_manager.constants import (
-    ACCESS_TOKEN_EXPIRE_MINUTES,
     APP_DESCRIPTION,
     APP_NAME,
     APP_VERSION,
-    COOKIE_SECURE,
-    DEFAULT_ADMIN_PASSWORD,
-    PASSWORD_SET_VIA_UI,
     PRESIGNED_STS_WARNING_THRESHOLD,
     PRESIGNED_URL_HARD_CEILING,
     PRESIGNED_URL_MIN_TTL,
@@ -77,15 +67,11 @@ from another_s3_manager.errors import S3OperationError
 from another_s3_manager.metrics import (
     REGISTRY,
     _seed_zero_series,
-    auth_bans_active,
-    auth_logins_total,
     http_request_duration_seconds,
     http_requests_in_flight,
     http_requests_total,
-    mcp_active_tokens,
     roles_gauge,
     upload_rejected_total,
-    users_gauge,
 )
 from another_s3_manager.s3_client import (
     clear_s3_clients_cache,
@@ -101,23 +87,12 @@ from another_s3_manager.s3_client import (
 from another_s3_manager.s3_client import (
     generate_presigned_url_for_role as s3_generate_presigned_url_for_role,
 )
-from another_s3_manager.users import (
-    count_users,
-    get_user_by_username,
-    get_users_for_admin,
-    load_bans,
-    load_users,
-    save_bans,
-    save_users,
-    sync_admin_password_from_env,
-)
 from another_s3_manager.utils import (
     format_boto_error,
     format_content_disposition,
     sanitize_bucket_name,
     sanitize_path,
     sanitize_search_prefix,
-    validate_password,
 )
 
 # Validate required environment variables at startup
@@ -193,66 +168,17 @@ def run_startup_tasks() -> None:
     """Everything the app does on startup EXCEPT entering the MCP session manager.
 
     Synchronous and side-effect-only. Split out of `lifespan` so it can be driven
-    directly by tests: `lifespan` can only ever run ONCE per process (FastMCP's
-    StreamableHTTPSessionManager.run() is a hard once-per-instance guard, and the
-    FastMCP instance is a module-level singleton), which makes multi-boot startup
-    scenarios untestable through the lifespan itself. This function has no such
-    limit and is idempotent — running it N times is exactly N restarts.
+    directly by tests. Identity is gateway-header only — no local user bootstrap.
     """
-    # 0. Quiet uvicorn access-log noise (health / uptime-monitor / scrape paths).
-    #    Installed here, inside startup, so uvicorn has already configured its
-    #    `uvicorn.access` logger by the time we attach the filter.
     install_access_log_filter()
 
-    # 1. DB migrations — must complete before any request hits a model
+    # Keep alembic running so existing PVC schemas stay migratable; web auth no
+    # longer reads the users/bans/api_tokens tables.
     try:
         _run_alembic_upgrade()
     except Exception:
         logger.critical("alembic upgrade failed", exc_info=True)
         raise
-
-    # 2. Legacy JSON → SQLite migration (idempotent)
-    try:
-        from another_s3_manager.migration import migrate_json_if_needed
-
-        migrate_json_if_needed()
-    except json.JSONDecodeError:
-        logger.critical(
-            "Legacy users.json or bans.json is corrupt. Fix or delete the file manually, then restart.",
-            exc_info=True,
-        )
-        sys.exit(1)
-    except Exception:
-        logger.warning("JSON migration failed; DB is still usable", exc_info=True)
-
-    # 3. One-time migration: legacy global config.default_role → per-user records
-    try:
-        _migrate_legacy_default_role()
-    except Exception:
-        logger.warning("Legacy default_role migration failed; continuing startup", exc_info=True)
-
-    # 4. Admin password: env sync, then the default-password warning.
-    #    The sync runs unconditionally — it is a no-op unless the environment governs the
-    #    admin password (users.password_set_via == "env") or the operator explicitly set
-    #    ADMIN_PASSWORD_FORCE. It also performs the one-time classification of rows that
-    #    predate the provenance column. Placed after steps 1-3 so the password_set_via
-    #    column exists and a legacy-JSON-migrated admin row is present before it runs.
-    try:
-        sync_admin_password_from_env()
-    except Exception:
-        # Same posture as the migrations above: a failed sync must not brick startup.
-        # It touches one row (username == 'admin') and does one bcrypt verify/hash; a
-        # transient DB or bcrypt error must not take down every other route. The failure
-        # is self-healing — provenance is left as-is and the sync retries on the next boot.
-        # (Unlike the alembic step, which IS fatal: a missing column breaks every query.)
-        logger.warning("ADMIN_PASSWORD startup sync failed; continuing startup", exc_info=True)
-
-    if os.getenv("ADMIN_PASSWORD", DEFAULT_ADMIN_PASSWORD) == DEFAULT_ADMIN_PASSWORD:
-        logger.warning(
-            f"ADMIN_PASSWORD is the default '{DEFAULT_ADMIN_PASSWORD}'. CHANGE IT before exposing "
-            "this app — admin is exempt from auto-ban and there is no application-level rate limit "
-            "on /api/login."
-        )
 
 
 @asynccontextmanager
@@ -600,9 +526,6 @@ def _check_metrics_auth(request: Request) -> None:
 # Scrape-time callbacks. Computing at scrape time (rather than hooking every
 # mutation) means the gauge can never drift out of sync with its source of truth
 # (the database, or config.json for roles_gauge).
-auth_bans_active.set_function(lambda: float(len(load_bans())))
-mcp_active_tokens.set_function(lambda: float(count_active_tokens()))
-users_gauge.set_function(lambda: float(count_users()))
 roles_gauge.set_function(lambda: float(len(load_config(force_reload=False).get("roles", []))))
 
 # Pre-create fixed-enum counter series at 0 so the very first real increment
@@ -626,128 +549,18 @@ async def health():
     return {"status": "ok", "version": APP_VERSION}
 
 
-def _migrate_legacy_default_role() -> None:
-    """Copy the legacy global `config.default_role` into compatible user records.
-
-    Runs at startup. Idempotent. Only updates users whose `default_role IS NULL`
-    AND who have the legacy role in their `allowed_roles`. Skips silently if
-    config has no legacy default. After this migration, `config.default_role`
-    is silently ignored on read (the field may still appear in config.json on
-    disk — that's fine, harmless legacy data).
-    """
-    config = load_config()
-    legacy_default = config.get("default_role")
-    if not legacy_default:
-        return
-
-    from another_s3_manager import users  # avoid circular imports
-
-    updated_count = 0
-    all_users = users.load_users().get("users", [])
-    for user in all_users:
-        if user.get("default_role") is None and legacy_default in user.get("allowed_roles", []):
-            users.update_user(user["username"], default_role=legacy_default)
-            updated_count += 1
-
-    if updated_count > 0:
-        logger.info(
-            "Migrated legacy config.default_role='%s' to %d user records",
-            legacy_default,
-            updated_count,
-        )
-
-
-def _enforce_password_policy(password: str) -> None:
-    """Reject the request if the password fails the configured policy.
-
-    Raises HTTPException(422) with a structured detail so the frontend can
-    render per-requirement checkmarks. Loads the policy from the cached
-    config (no file IO unless the cache is cold).
-    """
-    config = config_module.load_config(force_reload=False)
-    failures = validate_password(password, config)
-    if failures:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"error": "Password does not meet policy", "failed_requirements": failures},
-        )
-
-
-async def _maybe_issue_trusted_header_session(request: Request, response: Response) -> Optional[Dict[str, Any]]:
-    """Fail-closed SSO bridge for gateway-authenticated requests with no valid
-    app session yet.
-
-    This path trusts the forwarded identity only to BOOTSTRAP the first
-    s3manager session after authentik login. Once an app session exists, it
-    stays authoritative so a deliberate local admin login is not silently
-    overwritten by the gateway user's header on the next /api/me poll.
-    """
-    username = get_trusted_username(request)
-    if username is None:
-        return None
-
-    if await run_in_threadpool(check_ban, username):
-        bans = await run_in_threadpool(load_bans)
-        banned_until = bans.get(username, {}).get("banned_until", 0)
-        remaining = int((banned_until - time.time()) / 60)
-        auth_logins_total.labels(result="banned").inc()
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Account is banned. Try again in {remaining} minutes.",
-        )
-
-    user = await run_in_threadpool(get_user_by_username, username)
-    if user is None:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Authenticated upstream user '{username}' is not provisioned in s3manager",
-        )
-
-    user["csrf_token"] = issue_session_cookie(response, username)
-    auth_logins_total.labels(result="trusted_header").inc()
-    logger.info("Issued trusted-header session for username=%s", username)
-    return user
-
-
-async def _resolve_current_user_for_me(request: Request, response: Response) -> Dict[str, Any]:
-    """Resolve /api/me against an existing app session first, then the trusted
-    gateway header if the local session is absent or unusable."""
-    try:
-        return await run_in_threadpool(get_current_user, request)
-    except HTTPException as exc:
-        if exc.status_code != status.HTTP_401_UNAUTHORIZED:
-            raise
-        trusted_user = await _maybe_issue_trusted_header_session(request, response)
-        if trusted_user is not None:
-            return trusted_user
-        raise exc
-
-
 def _serialize_current_user_info(current_user: Dict[str, Any]) -> Dict[str, Any]:
-    """Render the /api/me payload from the canonical user dict."""
+    """Render the /api/me payload from the header-derived principal."""
     is_admin = current_user.get("is_admin", False)
     config = load_config()
-    # Admins can access every role in the config — surface the full list so the
-    # React sidebar matches admin permissions without an extra /api/config call.
     if is_admin:
         allowed_roles = [r["name"] for r in config.get("roles", []) if r.get("name")]
     else:
         allowed_roles = current_user.get("allowed_roles", [])
-    # disable_deletion: env var OR config (env wins). Mirrors the same combined
-    # check used in /api/config so the two endpoints don't disagree.
     disable_deletion_env = os.getenv("DISABLE_DELETION", "").lower() == "true"
     disable_deletion_config = config.get("disable_deletion", False)
     disable_deletion = disable_deletion_env or disable_deletion_config
-    # Computed default_role: explicit choice if still valid, else first of
-    # allowed_roles, else null. Helper lives in users.py so the rule lives
-    # next to the data layer that stores explicit_default.
-    from another_s3_manager.users import compute_default_role
-
-    default_role = compute_default_role(current_user.get("default_role"), allowed_roles)
-    # max_file_size: surface to client so it can validate sizes BEFORE the
-    # multipart POST and show a useful error per file. Without this, the
-    # browser uploads up to the limit, the backend rejects with 400, and the
-    # user sees a generic toast that doesn't say "this file is N MB, limit is M".
+    default_role = allowed_roles[0] if allowed_roles else None
     max_file_size_from_config = config.get("max_file_size")
     if max_file_size_from_config is None:
         max_file_size = int(os.getenv("MAX_FILE_SIZE", str(100 * 1024 * 1024)))
@@ -756,14 +569,14 @@ def _serialize_current_user_info(current_user: Dict[str, Any]) -> Dict[str, Any]
     return {
         "username": current_user.get("username"),
         "is_admin": is_admin,
-        "csrf_token": current_user.get("csrf_token"),  # Return CSRF token for client
-        "theme": current_user.get("theme", "auto"),  # Return user's theme preference
+        "csrf_token": current_user.get("csrf_token"),
+        "theme": current_user.get("theme", "auto"),
         "allowed_roles": allowed_roles,
         "default_role": default_role,
-        "must_change_password": bool(current_user.get("must_change_password", False)),
+        "must_change_password": False,
         "disable_deletion": disable_deletion,
         "max_file_size": max_file_size,
-        "app_name": APP_NAME,  # Return app name for client
+        "app_name": APP_NAME,
         "app_version": APP_VERSION,
     }
 
@@ -774,89 +587,21 @@ def _serialize_current_user_info(current_user: Dict[str, Any]) -> Dict[str, Any]
 
 
 @app.post("/api/login")
-async def login(
-    request: Request,
-    response: Response,
-    username: str = Form(...),
-    password: str = Form(...),
-):
-    """Login endpoint — issues an httpOnly cookie carrying the JWT."""
-    try:
-        # Check if user is banned
-        if check_ban(username):
-            bans = load_bans()
-            ban_data = bans.get(username, {})
-            banned_until = ban_data.get("banned_until", 0)
-            import time
-
-            remaining = int((banned_until - time.time()) / 60)
-            auth_logins_total.labels(result="banned").inc()
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Account is banned. Try again in {remaining} minutes.",
-            )
-
-        user = get_user_by_username(username)
-        if user is None and count_users() == 0:
-            # Fresh deployment, empty users table: load_users() lazily seeds
-            # the default admin from ADMIN_PASSWORD on its first call — that
-            # bootstrap has to happen somewhere, and login is the only
-            # request a truly empty install can make before anyone exists to
-            # log in as. Gated on count_users() (a cheap COUNT query) so this
-            # full load only ever runs once, not on every wrong-username
-            # login attempt against a populated table.
-            load_users()
-            user = get_user_by_username(username)
-
-        if user is None:
-            record_login_attempt(username, False)
-            # Same label as a wrong password — metrics must not enumerate usernames.
-            auth_logins_total.labels(result="invalid_password").inc()
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Incorrect username or password",
-            )
-
-        # Verify password
-        if not verify_password(password, user.get("password_hash", "")):
-            record_login_attempt(username, False)
-            auth_logins_total.labels(result="invalid_password").inc()
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Incorrect username or password",
-            )
-
-        # Successful login
-        record_login_attempt(username, True)
-        auth_logins_total.labels(result="success").inc()
-        issue_session_cookie(response, username)
-
-        return {"user": {"username": username, "is_admin": user.get("is_admin", False)}}
-    except HTTPException:
-        raise
-    except Exception:
-        # Log the full exception server-side; never echo str(e) back to the client
-        # (SQLAlchemy errors include SQL text + table names, requests / boto / etc
-        # may include URLs, credentials, or internal paths).
-        logger.exception("Login failed unexpectedly for username=%s", username)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Login failed",
-        )
+async def login_removed():
+    """Local password login is gone — identity comes from the gateway."""
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
 
 
 @app.post("/api/logout")
 async def logout(response: Response):
-    """Clear the auth cookie. No auth required — clearing an already-invalid cookie is harmless."""
+    """Clear the CSRF cookie. Auth itself is the gateway session."""
     response.delete_cookie("access_token", path="/")
     return {"ok": True}
 
 
 @app.get("/api/me")
-async def get_current_user_info(request: Request, response: Response):
-    """Get current user information, auto-bootstrapping the first local session
-    from the trusted gateway header when appropriate."""
-    current_user = await _resolve_current_user_for_me(request, response)
+async def get_current_user_info(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Return the gateway-derived principal and mint a CSRF cookie."""
     return _serialize_current_user_info(current_user)
 
 
@@ -870,697 +615,36 @@ async def get_app_info():
     }
 
 
-@app.get("/api/admin/users")
-async def list_users(current_user: Dict[str, Any] = Depends(get_current_admin_user)):
-    """List all users (admin only)"""
-    # Always reload config to get latest roles
-    config = load_config(force_reload=True)
-    available_roles = [role.get("name") for role in config.get("roles", [])]
-    # Returns user list including id field (used by admin token creation)
-    user_list = get_users_for_admin()
-    return {"users": user_list, "available_roles": available_roles}
-
-
-@app.post("/api/admin/users")
-async def create_user(
-    request: Request,
-    username: str = Form(...),
-    password: str = Form(...),
-    is_admin: bool = Form(False),
-    allowed_roles: str = Form("", description="Comma-separated list of allowed role names"),
-    must_change_password: bool = Form(True, description="Force user to change password on next login"),
-    current_user: Dict[str, Any] = Depends(get_current_admin_user),
-    csrf_verified: bool = Depends(verify_csrf_token),
-):
-    """Create a new user (admin only)"""
-    # Note: this still loads the full user list rather than a targeted lookup.
-    # save_users() below has full-replace semantics (any user present in the
-    # DB but absent from the list it's given gets deleted), so the full list
-    # has to be loaded anyway to append the new user and save it back without
-    # losing everyone else. The existence check just below is a free in-memory
-    # scan over that already-loaded list, not a second DB query. Admin-only,
-    # low-frequency — not the per-request hot path this fix targets.
-    users = load_users()
-
-    # Check if user already exists
-    if any(u.get("username") == username for u in users.get("users", [])):
-        raise HTTPException(status_code=400, detail="User already exists")
-
-    _enforce_password_policy(password)
-
-    # Hash password
-    password_bytes = password.encode("utf-8")
-    if len(password_bytes) > 72:
-        password = password_bytes[:72].decode("utf-8", errors="ignore")
-
-    # Hash password using auth module
-    hashed_password = hash_password(password)
-
-    # Parse allowed roles
-    roles_list = [r.strip() for r in allowed_roles.split(",") if r.strip()] if allowed_roles else []
-
-    # Import datetime for timestamp
-    from datetime import datetime
-
-    new_user = {
-        "username": username,
-        "password_hash": hashed_password,
-        "is_admin": is_admin,
-        "allowed_roles": roles_list,
-        "theme": "auto",  # Default to auto (system preference)
-        "must_change_password": must_change_password,
-        "password_set_via": PASSWORD_SET_VIA_UI,
-        "created_at": datetime.now().isoformat(),
-    }
-
-    users.setdefault("users", []).append(new_user)
-    save_users(users)
-
-    return {"message": "User created successfully", "username": username}
-
-
-class AdminResetPasswordRequest(BaseModel):
-    """Body for PUT /api/admin/users/{username}/password."""
-
-    password: str = Field(..., min_length=1, description="New password")
-    must_change_password: bool = Field(
-        default=True,
-        description=(
-            "Force the user to change this password on next login. "
-            "Default True (paranoid). Set False for service accounts."
-        ),
-    )
-
-
-class AdminResetPasswordResponse(BaseModel):
-    """Response for PUT /api/admin/users/{username}/password."""
-
-    message: str
-
-
-@app.put("/api/admin/users/{username}/password", response_model=AdminResetPasswordResponse)
-async def update_user_password(
-    request: Request,
-    username: str,
-    payload: AdminResetPasswordRequest,
-    current_user: Dict[str, Any] = Depends(get_current_admin_user),
-    csrf_verified: bool = Depends(verify_csrf_token),
-) -> AdminResetPasswordResponse:
-    """Update user password (admin only)"""
-    # Pydantic's min_length=1 catches empty strings (returns 422). This catches
-    # whitespace-only passwords like "   " which pass min_length but are invalid.
-    if len(payload.password.strip()) == 0:
-        raise HTTPException(status_code=400, detail="Password cannot be empty")
-
-    if not get_user_by_username(username):
-        raise HTTPException(status_code=404, detail="User not found")
-
-    _enforce_password_policy(payload.password)
-
-    # Hash password using auth module
-    hashed_password = hash_password(payload.password)
-
-    # Targeted single-row update — this only touches the one user being reset,
-    # not the whole table (load_users()/save_users() would load and rewrite
-    # every user just to change one password).
-    from another_s3_manager.users import update_user as users_update_user
-
-    try:
-        users_update_user(
-            username,
-            password_hash=hashed_password,
-            must_change_password=payload.must_change_password,
-            password_set_via=PASSWORD_SET_VIA_UI,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="User not found") from exc
-
-    return AdminResetPasswordResponse(message=f"Password updated successfully for user {username}")
-
-
-class ChangePasswordRequest(BaseModel):
-    """Body for self-service password change at PUT /api/me/password."""
-
-    current_password: str = Field(..., min_length=1, description="The user's current password")
-    new_password: str = Field(..., min_length=1, description="The new password to set")
-
-
-class CreateTokenRequest(BaseModel):
-    """Body for POST /api/me/tokens — create an API token for the current user."""
-
-    name: str = Field(..., min_length=1, max_length=100)
-    is_read_only: bool = True
-    max_read_bytes: int = Field(default=1_048_576, ge=1, le=10_485_760)
-
-
-class AdminCreateTokenRequest(CreateTokenRequest):
-    """Body for POST /api/admin/tokens — admin creates a token on behalf of a user."""
-
-    user_id: int = Field(..., gt=0)
-
-
-class UpdateTokenRequest(BaseModel):
-    """Body for PUT /api/me/tokens/{id} and PUT /api/admin/tokens/{id}.
-
-    All fields optional — the service rejects empty bodies with 400
-    'no fields to update' and out-of-range max_read_bytes with 400
-    'max_read_bytes out of range'. Range bounds intentionally NOT enforced at
-    the Pydantic layer so the contract is a single 400 error from the service,
-    not a 422 from validation.
-    """
-
-    name: Optional[str] = Field(default=None, min_length=1, max_length=100)
-    is_read_only: Optional[bool] = None
-    max_read_bytes: Optional[int] = None
-
-
-@app.put("/api/me/password")
-async def change_my_password(
-    payload: ChangePasswordRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-    csrf_verified: bool = Depends(verify_csrf_token),
-):
-    """Self-service password change.
-
-    Requires the user's current password in addition to a valid auth cookie + CSRF
-    token, so an attacker who steals the cookie still cannot lock the user out
-    without also knowing the current password.
-    """
-    # Re-fetch the password hash from storage — current_user dict from the JWT
-    # path doesn't carry it (and shouldn't).
-    username = current_user.get("username")
-    user = get_user_by_username(username)
-    if not user:
-        # Defensive: should be unreachable since get_current_user already resolved the user.
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
-
-    if not verify_password(payload.current_password, user.get("password_hash", "")):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Current password is incorrect",
-        )
-
-    if payload.current_password == payload.new_password:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="New password must differ from the current one",
-        )
-
-    _enforce_password_policy(payload.new_password)
-
-    # Local import to avoid the top-level name collision with the admin
-    # update_user endpoint defined below.
-    from another_s3_manager.users import update_user as users_update_user
-
-    users_update_user(
-        username,
-        password_hash=hash_password(payload.new_password),
-        must_change_password=False,
-        password_set_via=PASSWORD_SET_VIA_UI,
-    )
-    return {"ok": True}
-
-
-class UpdateDefaultRolePayload(BaseModel):
-    role: Optional[str] = None
-
-
-class UpdateDefaultRoleResponse(BaseModel):
-    default_role: Optional[str]
-
-
-def _effective_allowed_roles(current_user: Dict[str, Any]) -> list[str]:
-    """Same admin-vs-user role resolution used by GET /api/me.
-
-    Admins see every configured role; regular users see only their assigned
-    `allowed_roles`. Extracted so the PUT endpoint validates against the same
-    set the GET endpoint reports.
-    """
-    if current_user.get("is_admin", False):
-        config = load_config()
-        return [r["name"] for r in config.get("roles", []) if r.get("name")]
-    return current_user.get("allowed_roles", [])
-
-
-@app.put("/api/me/default-role", response_model=UpdateDefaultRoleResponse)
-async def update_my_default_role(
-    payload: UpdateDefaultRolePayload,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-    csrf_verified: bool = Depends(verify_csrf_token),
-) -> UpdateDefaultRoleResponse:
-    """Set the authenticated user's default role.
-
-    Payload: {"role": "<role-name>" | null}. `null` clears the explicit choice
-    so the computed fallback applies (first of allowed_roles, or null).
-    Returns 400 if the role is not in the user's allowed set.
-    """
-    from another_s3_manager.users import (
-        update_user as users_update_user_role,
-    )
-    from another_s3_manager.users import (
-        validate_default_role_choice,
-    )
-
-    try:
-        validate_default_role_choice(payload.role, _effective_allowed_roles(current_user))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    try:
-        users_update_user_role(current_user["username"], default_role=payload.role)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail=str(exc))
-    return UpdateDefaultRoleResponse(default_role=payload.role)
-
-
-# ---------------------------------------------------------------------------
-# Token CRUD helpers
-# ---------------------------------------------------------------------------
-
-from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
-
-from another_s3_manager import api_tokens as token_svc
-from another_s3_manager.models import User as UserModel
-
-
-def _get_user_id_by_username(username: str) -> int:
-    """Return the DB primary-key id for the given username.
-
-    Raises HTTPException 404 if the user is not found.
-    """
-    from another_s3_manager.database import session_scope
-
-    with session_scope() as session:
-        row = session.execute(select(UserModel).where(UserModel.username == username)).scalar_one_or_none()
-        if row is None:
-            raise HTTPException(status_code=404, detail="User not found")
-        return row.id
-
-
-def _serialize_token(t, owner_username: Optional[str] = None) -> dict:
-    """Serialize an ApiToken ORM row to a plain dict (no token_hash, no plaintext)."""
-
-    # SQLite drops tzinfo on storage even though our DateTime columns declare
-    # timezone=True; values come back naive. Since we always *write* UTC
-    # (api_tokens._utcnow → datetime.now(UTC)), force a 'Z' suffix on the
-    # serialized ISO so the browser parses it as UTC instead of local time.
-    # Without this, the React UI showed "Last used 2 hours ago" right after
-    # using a token from a UTC+2 browser.
-    def _iso_utc(d):
-        if d is None:
-            return None
-        if d.tzinfo is not None:
-            return d.isoformat()
-        return d.isoformat() + "Z"
-
-    out = {
-        "id": t.id,
-        "name": t.name,
-        "is_read_only": t.is_read_only,
-        "max_read_bytes": t.max_read_bytes,
-        "created_at": _iso_utc(t.created_at),
-        "last_used_at": _iso_utc(t.last_used_at),
-        "revoked_at": _iso_utc(t.revoked_at),
-    }
-    if owner_username is not None:
-        out["owner_username"] = owner_username
-    return out
-
-
-# ---------------------------------------------------------------------------
-# /api/me/tokens  (self-service)
-# ---------------------------------------------------------------------------
-
-
-@app.get("/api/me/tokens")
-async def get_my_tokens(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """List active API tokens for the authenticated user.
-
-    Returns tokens, used count, and per-user limit. Never returns token_plaintext.
-    """
-    user_id = _get_user_id_by_username(current_user["username"])
-    tokens = token_svc.list_tokens_for_user(user_id, include_revoked=False)
-    used = token_svc.count_active_tokens_for_user(user_id)
-    return {
-        "tokens": [_serialize_token(t) for t in tokens],
-        "used": used,
-        "limit": token_svc.PER_USER_TOKEN_LIMIT,
-    }
-
-
-@app.post("/api/me/tokens")
-async def create_my_token(
-    payload: CreateTokenRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-    csrf_verified: bool = Depends(verify_csrf_token),
-):
-    """Create a new API token for the authenticated user.
-
-    Returns token metadata + token_plaintext exactly once. Store it immediately —
-    it cannot be retrieved again.
-    """
-    user_id = _get_user_id_by_username(current_user["username"])
-    try:
-        token, plaintext = token_svc.create_token(user_id, payload.name, payload.is_read_only, payload.max_read_bytes)
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-    except IntegrityError:
-        raise HTTPException(status_code=409, detail=f"Token name '{payload.name}' already exists")
-    return {**_serialize_token(token), "token_plaintext": plaintext}
-
-
-@app.delete("/api/me/tokens/{token_id}")
-async def delete_my_token(
-    token_id: int,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-    csrf_verified: bool = Depends(verify_csrf_token),
-):
-    """Revoke one of the authenticated user's own tokens.
-
-    Returns 403 if the token belongs to another user, 404 if not found.
-    """
-    user_id = _get_user_id_by_username(current_user["username"])
-    try:
-        token_svc.revoke_token(token_id, by_user_id=user_id, by_is_admin=False)
-    except PermissionError:
-        raise HTTPException(status_code=403, detail="You can only revoke your own tokens")
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Token not found")
-    return {"ok": True}
-
-
-@app.put("/api/me/tokens/{token_id}")
-async def update_my_token(
-    token_id: int,
-    payload: UpdateTokenRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-    csrf_verified: bool = Depends(verify_csrf_token),
-):
-    """Update editable metadata (name, is_read_only, max_read_bytes) on the user's own token.
-
-    Returns 400 on empty body or out-of-range max_read_bytes, 403 for non-owner,
-    404 for missing or revoked tokens, 409 on name collision.
-    """
-    user_id = _get_user_id_by_username(current_user["username"])
-    try:
-        updated = token_svc.update_token(
-            token_id=token_id,
-            by_user_id=user_id,
-            by_is_admin=False,
-            name=payload.name,
-            is_read_only=payload.is_read_only,
-            max_read_bytes=payload.max_read_bytes,
-        )
-    except PermissionError:
-        raise HTTPException(status_code=403, detail="You can only update your own tokens")
-    except IntegrityError:
-        raise HTTPException(status_code=409, detail=f"Token name '{payload.name}' already exists")
-    except ValueError as exc:
-        msg = str(exc)
-        if "no fields to update" in msg or "out of range" in msg:
-            raise HTTPException(status_code=400, detail=msg)
-        # "not found" or "is revoked" -> 404 (revoked tokens are treated as gone)
-        raise HTTPException(status_code=404, detail=msg)
-    return _serialize_token(updated)
-
-
-# ---------------------------------------------------------------------------
-# /api/admin/tokens  (admin-only)
-# ---------------------------------------------------------------------------
-
-
-@app.get("/api/admin/tokens")
-async def admin_list_tokens(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """List all active API tokens across all users (admin only).
-
-    Each entry includes owner_username for display in the admin panel.
-    """
-    if not current_user.get("is_admin", False):
-        raise HTTPException(status_code=403, detail="Admin access required")
-    rows = token_svc.list_all_tokens(include_revoked=False)
-    return {"tokens": [_serialize_token(t, owner_username=u.username) for t, u in rows]}
-
-
-@app.post("/api/admin/tokens")
-async def admin_create_token(
-    payload: AdminCreateTokenRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-    csrf_verified: bool = Depends(verify_csrf_token),
-):
-    """Create an API token on behalf of any user (admin only).
-
-    Requires user_id (not username) in the request body; the caller (SPA)
-    must resolve username→id from the users list before calling this endpoint.
-    """
-    if not current_user.get("is_admin", False):
-        raise HTTPException(status_code=403, detail="Admin access required")
-    # Validate that the target user exists before attempting to create the token.
-    # Without this check, a bogus user_id triggers an FK IntegrityError which
-    # the except-block below would incorrectly map to 409 "Token name already exists".
-    from another_s3_manager.database import session_scope
-
-    with session_scope() as _session:
-        user_exists = _session.execute(select(UserModel.id).where(UserModel.id == payload.user_id)).scalar_one_or_none()
-    if user_exists is None:
-        raise HTTPException(status_code=404, detail=f"User with id {payload.user_id} not found")
-    try:
-        token, plaintext = token_svc.create_token(
-            payload.user_id, payload.name, payload.is_read_only, payload.max_read_bytes
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-    except IntegrityError:
-        raise HTTPException(status_code=409, detail=f"Token name '{payload.name}' already exists for this user")
-    return {**_serialize_token(token), "token_plaintext": plaintext}
-
-
-@app.delete("/api/admin/tokens/{token_id}")
-async def admin_delete_token(
-    token_id: int,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-    csrf_verified: bool = Depends(verify_csrf_token),
-):
-    """Revoke any token regardless of owner (admin only)."""
-    if not current_user.get("is_admin", False):
-        raise HTTPException(status_code=403, detail="Admin access required")
-    try:
-        # by_is_admin=True bypasses owner check; by_user_id is irrelevant when admin.
-        token_svc.revoke_token(token_id, by_user_id=0, by_is_admin=True)
-    except ValueError:
-        raise HTTPException(status_code=404, detail="Token not found")
-    return {"ok": True}
-
-
-@app.put("/api/admin/tokens/{token_id}")
-async def admin_update_token(
-    token_id: int,
-    payload: UpdateTokenRequest,
-    current_user: Dict[str, Any] = Depends(get_current_user),
-    csrf_verified: bool = Depends(verify_csrf_token),
-):
-    """Admin endpoint: update any token's editable metadata regardless of owner.
-
-    Returns the same shape as the admin list (`owner_username` included) so the
-    SPA can patch its cache in place. 400 on bad input, 404 on missing/revoked,
-    409 on name collision.
-    """
-    if not current_user.get("is_admin", False):
-        raise HTTPException(status_code=403, detail="Admin access required")
-
-    actor_user_id = _get_user_id_by_username(current_user["username"])
-    try:
-        updated = token_svc.update_token(
-            token_id=token_id,
-            by_user_id=actor_user_id,
-            by_is_admin=True,
-            name=payload.name,
-            is_read_only=payload.is_read_only,
-            max_read_bytes=payload.max_read_bytes,
-        )
-    except IntegrityError:
-        raise HTTPException(status_code=409, detail=f"Token name '{payload.name}' already exists for this user")
-    except ValueError as exc:
-        msg = str(exc)
-        if "no fields to update" in msg or "out of range" in msg:
-            raise HTTPException(status_code=400, detail=msg)
-        # "not found" or "is revoked" -> 404 (revoked tokens are treated as gone)
-        raise HTTPException(status_code=404, detail=msg)
-
-    # Mirror admin_list_tokens shape: include owner_username for the admin SPA.
-    # owner_username is part of the admin response contract — we 404 explicitly
-    # if the user vanished between update and lookup (extremely rare given FK
-    # CASCADE + single-worker SQLite, but the alternative — silently omitting
-    # the key from the JSON — would mislead the SPA cache patch logic).
-    from another_s3_manager.database import session_scope
-
-    with session_scope() as session:
-        owner_username = session.execute(
-            select(UserModel.username).where(UserModel.id == updated.user_id)
-        ).scalar_one_or_none()
-    if owner_username is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Owner of token {token_id} no longer exists",
-        )
-    return _serialize_token(updated, owner_username=owner_username)
-
-
-@app.put("/api/admin/users/{username}")
-async def update_user(
-    request: Request,
-    username: str,
-    current_user: Dict[str, Any] = Depends(get_current_admin_user),
-    csrf_verified: bool = Depends(verify_csrf_token),
-):
-    """Update user permissions (admin only).
-
-    Reads multipart form fields manually via request.form() instead of
-    `is_admin: Optional[str] = Form(None)` because FastAPI coerces an
-    EMPTY field value to None, making it impossible to distinguish
-    "field omitted" from "field present but empty" — which broke
-    "clear all roles for a user" (the empty string fell through the
-    `if allowed_roles is not None` guard and the row never updated).
-    """
-    form = await request.form()
-
-    is_admin_raw = form.get("is_admin")
-    allowed_roles_raw = form.get("allowed_roles")
-
-    if not get_user_by_username(username):
-        raise HTTPException(status_code=404, detail="User not found")
-
-    # Coerce only when the form value is a non-empty string. An empty value
-    # ("is_admin=") would otherwise fall through `is not None` and silently
-    # demote the target user, since str("").lower() != "true" → False.
-    is_admin: Optional[bool] = None
-    if is_admin_raw is not None and str(is_admin_raw) != "":
-        is_admin = str(is_admin_raw).lower() == "true"
-
-    # Self-demote guard: an admin cannot remove their own admin rights through this
-    # endpoint. Frontend disables the toggle on the current-user row, but enforce
-    # server-side too (defence in depth, e.g. against a hand-crafted curl request).
-    if username == current_user.get("username") and is_admin is False:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="You can't remove your own admin rights.",
-        )
-
-    update_kwargs: Dict[str, Any] = {}
-    if is_admin is not None:
-        update_kwargs["is_admin"] = is_admin
-
-    # Presence of the form key means the client wants to set roles — possibly
-    # to an empty list. Absence means leave the field alone.
-    if "allowed_roles" in form:
-        raw = str(allowed_roles_raw or "")
-        roles_list = [r.strip() for r in raw.split(",") if r.strip()]
-        update_kwargs["allowed_roles"] = roles_list
-
-    if update_kwargs:
-        # Targeted single-row update — this only touches the one user being
-        # edited, not the whole table (load_users()/save_users() would load
-        # and rewrite every user just to change one).
-        from another_s3_manager.users import update_user as users_update_user
-
-        try:
-            users_update_user(username, **update_kwargs)
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail="User not found") from exc
-
-    return {"message": f"User {username} updated successfully"}
-
-
 @app.put("/api/user/theme")
 async def update_user_theme(
-    request: Request,
-    theme: str = Body(..., embed=True, description="Theme preference: 'light' or 'dark' (auto only for initial state)"),
+    theme: str = Form(...),
     current_user: Dict[str, Any] = Depends(get_current_user),
-    csrf_verified: bool = Depends(verify_csrf_token),
+    csrf_valid: bool = Depends(verify_csrf_token),
 ):
-    """Update user's theme preference"""
-    # Allow only 'light' or 'dark' for manual changes (auto is only for initial state)
-    if theme not in ["light", "dark"]:
-        raise HTTPException(status_code=400, detail="Theme must be 'light' or 'dark'")
-
-    username = current_user.get("username")
-    if not get_user_by_username(username):
-        raise HTTPException(status_code=404, detail="User not found")
-
-    # Targeted single-row update — this only touches the caller's own row,
-    # not the whole table (load_users()/save_users() would load and rewrite
-    # every user just to change one theme preference).
-    from another_s3_manager.users import update_user as users_update_user
-
-    try:
-        users_update_user(username, theme=theme)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="User not found") from exc
-
-    return {"message": f"Theme updated to {theme}", "theme": theme}
+    """Theme preference is not persisted without local users; accept and ignore."""
+    if theme not in ("auto", "light", "dark"):
+        raise HTTPException(status_code=400, detail="theme must be auto, light, or dark")
+    return {"ok": True, "theme": theme}
 
 
-@app.delete("/api/admin/users/{username}")
-async def delete_user(
-    request: Request,
-    username: str,
-    current_user: Dict[str, Any] = Depends(get_current_admin_user),
-    csrf_verified: bool = Depends(verify_csrf_token),
+async def _local_account_gone():
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+
+for _path, _methods in (
+    ("/api/admin/users", ["GET", "POST"]),
+    ("/api/admin/users/{username}", ["PUT", "DELETE"]),
+    ("/api/admin/users/{username}/password", ["PUT"]),
+    ("/api/admin/bans", ["GET"]),
+    ("/api/admin/bans/{username}", ["DELETE"]),
+    ("/api/me/password", ["PUT"]),
+    ("/api/me/default-role", ["PUT"]),
+    ("/api/me/tokens", ["GET", "POST"]),
+    ("/api/me/tokens/{token_id}", ["DELETE", "PUT"]),
+    ("/api/admin/tokens", ["GET", "POST"]),
+    ("/api/admin/tokens/{token_id}", ["DELETE", "PUT"]),
 ):
-    """Delete a user (admin only)"""
-    if username == current_user.get("username"):
-        raise HTTPException(status_code=400, detail="Cannot delete yourself")
-
-    # Targeted single-row delete (no-op if already missing) — this only
-    # touches the one user being removed, not the whole table
-    # (load_users()/save_users() would load and rewrite every remaining user
-    # just to delete one).
-    from another_s3_manager.users import delete_user as users_delete_user
-
-    users_delete_user(username)
-
-    return {"message": f"User {username} deleted successfully"}
-
-
-@app.get("/api/admin/bans")
-async def list_bans(current_user: Dict[str, Any] = Depends(get_current_admin_user)):
-    """List all banned users (admin only)"""
-    bans = load_bans()
-    ban_list = []
-    import time
-
-    current_time = time.time()
-    for username, ban_data in bans.items():
-        banned_until = ban_data.get("banned_until", 0)
-        remaining = int((banned_until - current_time) / 60)
-        ban_list.append(
-            {
-                "username": username,
-                "banned_until": banned_until,
-                "banned_at": ban_data.get("banned_at"),
-                "reason": ban_data.get("reason"),
-                "remaining_minutes": remaining if remaining > 0 else 0,
-            }
-        )
-    return {"bans": ban_list}
-
-
-@app.delete("/api/admin/bans/{username}")
-async def unban_user(
-    request: Request,
-    username: str,
-    current_user: Dict[str, Any] = Depends(get_current_admin_user),
-    csrf_verified: bool = Depends(verify_csrf_token),
-):
-    """Unban a user (admin only)"""
-    bans = load_bans()
-    if username in bans:
-        del bans[username]
-        save_bans(bans)
-        # Login attempts are managed in auth module, no need to reset here
-        return {"message": f"User {username} unbanned successfully"}
-    else:
-        raise HTTPException(status_code=404, detail="User is not banned")
+    app.add_api_route(_path, _local_account_gone, methods=_methods, include_in_schema=False)
 
 
 @app.get("/api/config")
@@ -1651,13 +735,8 @@ async def get_config(
         }
         return safe_config
 
-    # For regular users, filter roles by permissions
-    user = get_user_by_username(current_user.get("username"))
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    # Get allowed roles for this user
-    allowed_roles = user.get("allowed_roles", [])
+    # For regular users, filter roles by gateway-derived permissions
+    allowed_roles = current_user.get("allowed_roles", [])
     if not allowed_roles:
         # No roles allowed, return empty config with all required fields
         return {
@@ -2059,13 +1138,7 @@ def validate_role_access(role_name: Optional[str], current_user: Dict[str, Any])
     if current_user.get("is_admin", False):
         return role_name
 
-    # Check if user has access to this role — targeted lookup, not a full-table
-    # load_users() scan (this runs on most bucket/file requests for non-admins).
-    user = get_user_by_username(current_user.get("username"))
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    allowed_roles = user.get("allowed_roles", [])
+    allowed_roles = current_user.get("allowed_roles", [])
     if role_name not in allowed_roles:
         raise HTTPException(
             status_code=403, detail=f"Access denied: You don't have permission to use role '{role_name}'"
@@ -2413,57 +1486,9 @@ async def upload_file(
         ) from e
 
 
-def get_user_for_download(token: Optional[str] = Query(None), request: Request = None) -> Dict[str, Any]:
-    """Get user from token in URL or Bearer header for downloads"""
-    from jose import JWTError, jwt
-
-    from another_s3_manager.auth import get_jwt_secret_key
-    from another_s3_manager.constants import JWT_ALGORITHM
-    from another_s3_manager.users import get_user_by_username
-
-    # Try token from URL first (for direct link downloads without buffering)
-    if token:
-        try:
-            payload = jwt.decode(token, get_jwt_secret_key(), algorithms=[JWT_ALGORITHM])
-            username = payload.get("sub")
-            if username:
-                # Targeted lookup — this runs on every download request, so a
-                # load_users() full-table scan would be an O(N) DB read per download.
-                user = get_user_by_username(username)
-                if user:
-                    user["csrf_token"] = payload.get("csrf_token")
-                    return user
-        except (JWTError, ValueError):
-            # Bad JWT or malformed user input — try the next candidate (or fall through to 401).
-            pass
-
-    # Fall back to Bearer header (legacy vanilla UI) or access_token cookie (cookie-auth UI)
-    if request:
-        candidates = []
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            candidates.append(auth_header[7:])
-        cookie_token = request.cookies.get("access_token")
-        if cookie_token:
-            candidates.append(cookie_token)
-
-        for candidate in candidates:
-            try:
-                payload = jwt.decode(candidate, get_jwt_secret_key(), algorithms=[JWT_ALGORITHM])
-                username = payload.get("sub")
-                if username:
-                    user = get_user_by_username(username)
-                    if user:
-                        user["csrf_token"] = payload.get("csrf_token")
-                        return user
-            except (JWTError, ValueError):
-                # Bad JWT or malformed user input — try the next candidate (or fall through to 401).
-                pass
-
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Authentication required",
-    )
+def get_user_for_download(request: Request, response: Response) -> Dict[str, Any]:
+    """Downloads go through the gateway too — same header principal as everything else."""
+    return get_current_user(request, response)
 
 
 @app.get("/api/buckets/{bucket_name}/download")
@@ -2748,7 +1773,7 @@ _SPA_DIR = STATIC_DIR / "app"
 # clients and would mask MCP misroutes. (Known routes and the /mcp mount
 # win by registration order; this guard covers the UNKNOWN remainder.)
 _RESERVED_PREFIXES = ("api/", "mcp/")
-_RESERVED_EXACT = {"api", "mcp", "metrics", "health"}
+_RESERVED_EXACT = {"api", "mcp", "metrics", "health", "login"}
 
 
 # Pre-Phase-7, bare /mcp worked via Starlette's redirect_slashes (307 to
@@ -2774,7 +1799,12 @@ async def serve_spa(full_path: str):
 
     from fastapi import Response
 
-    if full_path in _RESERVED_EXACT or full_path.startswith(_RESERVED_PREFIXES):
+    if (
+        full_path in _RESERVED_EXACT
+        or full_path.startswith(_RESERVED_PREFIXES)
+        or full_path == "login"
+        or full_path.startswith("login/")
+    ):
         raise HTTPException(status_code=404, detail="Not found")
 
     # Block path traversal at the route level (sanitize_path is for S3 keys)
