@@ -47,13 +47,14 @@ def test_app_info_metric_present(app_client):
     assert "as3m_app_info" in resp.text
 
 
-def _seed_user(username: str, password: str) -> None:
-    from another_s3_manager.auth import hash_password
+def _seed_user(username: str, password: str = "x") -> None:
     from another_s3_manager.database import session_scope
     from another_s3_manager.models import User
 
+    del password  # local passwords are gone; row only exists for MCP token FK
     with session_scope() as session:
-        session.add(User(username=username, password_hash=hash_password(password), is_admin=False))
+        session.add(User(username=username, password_hash="x", is_admin=False))
+
 
 
 def _sample(name: str, labels: dict) -> float:
@@ -62,74 +63,8 @@ def _sample(name: str, labels: dict) -> float:
     return REGISTRY.get_sample_value(name, labels) or 0.0
 
 
-def test_auth_login_metrics_count_success_and_failure(app_client):
-    """auth_logins_total must increment on both login outcomes (was defined but unwired)."""
-    ok_before = _sample("as3m_auth_logins_total", {"result": "success"})
-    bad_before = _sample("as3m_auth_logins_total", {"result": "invalid_password"})
-
-    resp = app_client.post("/api/login", data={"username": "admin", "password": "nope"})
-    assert resp.status_code == 401
-    resp = app_client.post("/api/login", data={"username": "admin", "password": "admin123"})
-    assert resp.status_code == 200
-
-    assert _sample("as3m_auth_logins_total", {"result": "success"}) == ok_before + 1
-    assert _sample("as3m_auth_logins_total", {"result": "invalid_password"}) == bad_before + 1
-
-    body = app_client.get("/metrics").text
-    assert 'as3m_auth_logins_total{result="success"}' in body
 
 
-def test_auth_banned_login_metric_and_active_bans_gauge(app_client):
-    """A login attempt against a banned account counts as result=banned, and
-    auth_bans_active reports the live number of active bans at scrape time."""
-    banned_before = _sample("as3m_auth_logins_total", {"result": "banned"})
-
-    _seed_user("metrics_bob", "Sup3rSecret1")
-    for _ in range(3):
-        resp = app_client.post("/api/login", data={"username": "metrics_bob", "password": "wrong"})
-        assert resp.status_code == 401
-
-    # 4th attempt hits the banned branch — even with the correct password
-    resp = app_client.post("/api/login", data={"username": "metrics_bob", "password": "Sup3rSecret1"})
-    assert resp.status_code == 403
-
-    assert _sample("as3m_auth_logins_total", {"result": "banned"}) == banned_before + 1
-
-    body = app_client.get("/metrics").text
-    assert "as3m_auth_bans_active 1.0" in body  # fresh per-test DB → exactly one active ban
-
-
-def test_ban_increments_the_counter(monkeypatch):
-    import another_s3_manager.auth as auth
-    import another_s3_manager.users as users
-
-    before = _sample("as3m_auth_bans_total", {})
-
-    saved: dict = {}
-    monkeypatch.setattr(users, "load_bans", lambda: {})
-    monkeypatch.setattr(users, "save_bans", lambda bans: saved.update(bans))
-
-    _seed_user("victim", "pw12345678")  # non-admin, so the ban path is reachable
-    for _ in range(3):
-        auth.record_login_attempt("victim", success=False)
-
-    assert "victim" in saved
-    assert _sample("as3m_auth_bans_total", {}) == before + 1
-
-
-def test_admin_is_never_banned_and_never_counted(monkeypatch):
-    """Admins are exempt by design (DoS protection on the predictable name)."""
-    import another_s3_manager.auth as auth
-    import another_s3_manager.users as users
-
-    before = _sample("as3m_auth_bans_total", {})
-    monkeypatch.setattr(users, "load_bans", lambda: {})
-    monkeypatch.setattr(users, "save_bans", lambda bans: None)
-
-    for _ in range(5):
-        auth.record_login_attempt("admin", success=False)
-
-    assert _sample("as3m_auth_bans_total", {}) == before
 
 
 OLD_NAMES = [
@@ -395,8 +330,7 @@ def test_oversize_upload_is_counted_as_size_limit(app_client, monkeypatch):
     from another_s3_manager import config as config_module
     from tests.test_main import login
 
-    login(app_client)
-    csrf = app_client.get("/api/me").json()["csrf_token"]
+    _, headers = login(app_client)
 
     # resolve_max_file_size() now lives in config.py (main.py just imports
     # it — see the MCP upload-guard review's finding 4), so its internal
@@ -413,7 +347,7 @@ def test_oversize_upload_is_counted_as_size_limit(app_client, monkeypatch):
         "/api/buckets/bkt1/upload",
         files={"file": ("big.bin", b"x" * 100, "application/octet-stream")},
         data={"key": "big.bin", "role": "r1"},
-        headers={"X-CSRF-Token": csrf},
+        headers=headers,
     )
 
     assert resp.status_code == 413
@@ -521,19 +455,6 @@ def test_token_issue_and_revoke_counters(app_client):
 # ---------------------------------------------------------------------------
 
 
-def test_users_and_roles_gauges(app_client, monkeypatch):
-    _seed_user("gaugecount", "pw12345678")
-    app_client.get("/metrics")
-    assert _sample("as3m_users", {}) >= 1
-
-    from another_s3_manager import main as main_module
-
-    monkeypatch.setattr(
-        main_module, "load_config", lambda force_reload=False: {"roles": [{"name": "a"}, {"name": "b"}]}
-    )
-    app_client.get("/metrics")
-    assert _sample("as3m_roles", {}) == 2.0
-
 
 def test_db_error_is_counted():
     """A failing statement is still classified by its verb: a bad SELECT is a SELECT."""
@@ -559,6 +480,12 @@ def test_db_error_is_counted():
 _ALLOWED_WITHOUT_CALL_SITE = {
     # Populated by prometheus_client itself at definition time.
     "app_info",
+    # Local login/bans/users table are gone; gauges kept for Grafana panel
+    # compatibility until the dashboard drops them.
+    "auth_logins_total",
+    "auth_bans_active",
+    "auth_bans_total",
+    "users_gauge",
 }
 
 

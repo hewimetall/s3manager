@@ -37,37 +37,10 @@ def reload_users_module():
     return users
 
 
-def ensure_admin_exists(auth_module, users_module):
-    data = users_module.load_users()
-    if not any(user.get("username") == "admin" for user in data.get("users", [])):
-        data.setdefault("users", []).append(
-            {
-                "username": "admin",
-                "password_hash": auth_module.hash_password("admin123"),
-                "is_admin": True,
-                "allowed_roles": [],
-                "theme": "auto",
-                "created_at": datetime.now().isoformat(),
-            }
-        )
-        users_module.save_users(data)
-
-
 def test_reload_helpers():
     assert hasattr(reload_main(), "app")
     assert reload_auth_module()
     assert reload_users_module()
-
-
-def test_reset_auth_state_adds_admin():
-    users_module = reload_users_module()
-    users_module.save_users({"users": []})
-    auth_module = reload_auth_module()
-    auth_module._login_attempts = {}
-    users_module.save_bans({})
-    ensure_admin_exists(auth_module, users_module)
-    data = users_module.load_users()
-    assert any(user.get("username") == "admin" for user in data["users"])
 
 
 def test_main_import_without_dotenv(monkeypatch):
@@ -102,56 +75,33 @@ def test_main_exits_when_secret_missing(monkeypatch):
     importlib.reload(module)
 
 
-@pytest.fixture(autouse=True)
-def reset_auth_state():
-    auth_module = reload_auth_module()
-    auth_module._login_attempts = {}
-    users_module = reload_users_module()
-    users_module.save_bans({})
-    ensure_admin_exists(auth_module, users_module)
+def login(client, username="admin", password="admin123", *, groups=None):
+    """Authenticate the TestClient via gateway headers.
 
-
-def login(client, username="admin", password="admin123"):
-    auth_module = reload_auth_module()
-    auth_module._login_attempts = {}
-    users_module = reload_users_module()
-    users_module.save_bans({})
-    response = client.post(
-        "/api/login",
-        data={"username": username, "password": password},
-    )
-    assert response.status_code == status.HTTP_200_OK
-    data = response.json()
-    # Cookie-based auth: TestClient's cookie jar auto-captures the Set-Cookie
-    # response header, so subsequent calls on the same client send the
-    # access_token cookie. CSRF token now lives only in the JWT (not in the
-    # login body) and is exposed via /api/me for the client to echo back in
-    # the X-CSRF-Token header on mutating requests.
-    me_response = client.get("/api/me")
-    assert me_response.status_code == status.HTTP_200_OK, me_response.text
-    csrf = me_response.json()["csrf_token"]
-    headers = {
-        "X-CSRF-Token": csrf,
+    Local password login is gone. ``password`` is ignored and kept only so
+    older call sites that still pass it keep working. Identity and roles come
+    from ``x-authentik-*`` on every request (including CSRF-bearing ones).
+    """
+    del password  # local passwords are not used
+    if groups is None:
+        groups = "admin" if username == "admin" else username
+    if not isinstance(groups, str):
+        groups = "|".join(groups)
+    gateway = {
+        "x-authentik-username": username,
+        "x-authentik-groups": groups,
     }
-    return data, headers
-
-
-def create_user(username, password="password", is_admin=False, allowed_roles=None):
-    users_module = reload_users_module()
-    auth_module = reload_auth_module()
-
-    data = users_module.load_users()
-    data["users"].append(
-        {
-            "username": username,
-            "password_hash": auth_module.hash_password(password),
-            "is_admin": is_admin,
-            "allowed_roles": allowed_roles or [],
-            "theme": "auto",
-            "created_at": datetime.now().isoformat(),
-        }
-    )
-    users_module.save_users(data)
+    me_response = client.get("/api/me", headers=gateway)
+    assert me_response.status_code == status.HTTP_200_OK, me_response.text
+    body = me_response.json()
+    headers = {
+        "X-CSRF-Token": body["csrf_token"],
+        **gateway,
+    }
+    # TestClient keeps cookies automatically; gateway identity is header-based,
+    # so pin the trusted headers on the client for subsequent requests.
+    client.headers.update(headers)
+    return {"user": body}, headers
 
 
 def _seed_spa_index():
@@ -184,7 +134,9 @@ def test_spa_fallback_serves_index_for_unknown_paths(app_client):
     so React Router renders the page (or its 404)."""
     index_file, created = _seed_spa_index()
     try:
-        for path in ("/login", "/r/aws-prod/b/images/p/2026/photos", "/v2/anything"):
+        # /login is reserved after local-login removal — must not be SPA-swallowed.
+        assert app_client.get("/login").status_code == 404
+        for path in ("/r/aws-prod/b/images/p/2026/photos", "/v2/anything"):
             response = app_client.get(path)
             assert response.status_code == 200, f"{path} -> {response.status_code}"
             assert "root" in response.text
@@ -211,138 +163,16 @@ def test_spa_catchall_does_not_swallow_reserved_prefixes(app_client):
             index_file.unlink()
 
 
-def test_login_success(app_client):
-    data, _ = login(app_client)
-    # After cookie-based auth migration: body returns only the user object,
-    # the JWT itself rides in an httpOnly cookie set via Set-Cookie header.
-    assert data["user"]["username"] == "admin"
-    assert data["user"]["is_admin"] is True
-    assert "access_token" not in data
-    assert "csrf_token" not in data
 
 
-def test_login_failure(app_client):
-    response = app_client.post("/api/login", data={"username": "admin", "password": "wrong"})
-    assert response.status_code == status.HTTP_401_UNAUTHORIZED
 
 
-def test_login_sets_httponly_cookie_and_returns_user_only(app_client, monkeypatch):
-    """Successful login: Set-Cookie header has access_token; body has only user object (no token)."""
-    monkeypatch.setenv("ADMIN_PASSWORD", "test-pw-12345")
-    from another_s3_manager.auth import hash_password
-    from another_s3_manager.users import save_users
-
-    save_users(
-        {
-            "users": [
-                {
-                    "username": "admin",
-                    "password_hash": hash_password("test-pw-12345"),
-                    "is_admin": True,
-                    "allowed_roles": [],
-                    "theme": "auto",
-                }
-            ]
-        }
-    )
-
-    response = app_client.post(
-        "/api/login",
-        data={"username": "admin", "password": "test-pw-12345"},
-    )
-    assert response.status_code == 200
-
-    # Cookie set with httpOnly + SameSite=Strict
-    set_cookie = response.headers.get("set-cookie", "")
-    assert "access_token=" in set_cookie
-    assert "HttpOnly" in set_cookie
-    assert "SameSite=strict" in set_cookie or "samesite=strict" in set_cookie.lower()
-
-    # Body shape: only `user`, no `access_token` / `token_type` / `csrf_token`
-    body = response.json()
-    assert "access_token" not in body
-    assert "csrf_token" not in body  # CSRF now comes via /api/me, not login body
-    assert body["user"] == {"username": "admin", "is_admin": True}
 
 
-def test_login_wrong_password_no_cookie(app_client, monkeypatch):
-    """Wrong password: 401, no Set-Cookie."""
-    monkeypatch.setenv("ADMIN_PASSWORD", "test-pw-12345")
-    from another_s3_manager.auth import hash_password
-    from another_s3_manager.users import save_users
-
-    save_users(
-        {
-            "users": [
-                {
-                    "username": "admin",
-                    "password_hash": hash_password("test-pw-12345"),
-                    "is_admin": True,
-                    "allowed_roles": [],
-                    "theme": "auto",
-                }
-            ]
-        }
-    )
-
-    response = app_client.post(
-        "/api/login",
-        data={"username": "admin", "password": "WRONG"},
-    )
-    assert response.status_code == 401
-    assert "access_token=" not in response.headers.get("set-cookie", "")
 
 
-def test_logout_clears_cookie(app_client, monkeypatch):
-    """POST /api/logout returns ok and Set-Cookie that clears access_token."""
-    # Seed admin
-    monkeypatch.setenv("ADMIN_PASSWORD", "test-pw-12345")
-    from another_s3_manager.auth import hash_password
-    from another_s3_manager.users import save_users
-
-    save_users(
-        {
-            "users": [
-                {
-                    "username": "admin",
-                    "password_hash": hash_password("test-pw-12345"),
-                    "is_admin": True,
-                    "allowed_roles": [],
-                    "theme": "auto",
-                }
-            ]
-        }
-    )
-
-    # Log in to get the cookie
-    login = app_client.post(
-        "/api/login",
-        data={"username": "admin", "password": "test-pw-12345"},
-    )
-    assert login.status_code == 200
-
-    # Logout
-    response = app_client.post("/api/logout")
-    assert response.status_code == 200
-    assert response.json() == {"ok": True}
-
-    set_cookie = response.headers.get("set-cookie", "")
-    assert "access_token=" in set_cookie
-    # Cookie cleared via Max-Age=0 or expires in past
-    assert "Max-Age=0" in set_cookie or "max-age=0" in set_cookie.lower() or "expires=" in set_cookie.lower()
 
 
-def test_login_banned_user(app_client):
-    """Non-admins get auto-banned after MAX_LOGIN_ATTEMPTS failures and the
-    /api/login endpoint then refuses with 403. (Admins are exempt — see
-    test_auth.test_record_login_attempt_admin_is_never_banned.)"""
-    auth_module = reload_auth_module()
-    create_user("alice", password="alice-pw", is_admin=False)
-    for _ in range(auth_module.MAX_LOGIN_ATTEMPTS):
-        auth_module.record_login_attempt("alice", success=False)
-    assert auth_module.check_ban("alice") is True
-    response = app_client.post("/api/login", data={"username": "alice", "password": "alice-pw"})
-    assert response.status_code == status.HTTP_403_FORBIDDEN
 
 
 def test_get_current_user_info(app_client):
@@ -361,41 +191,10 @@ def test_get_current_user_info_requires_auth(app_client):
     assert response.status_code == status.HTTP_401_UNAUTHORIZED
 
 
-def test_me_bootstraps_session_from_trusted_header(app_client):
-    """A gateway-authenticated request with no app cookie should get a local
-    session minted from the forwarded username and reuse it on the next call."""
-    create_user("alice", password="alicepass", is_admin=False)
-
-    response = app_client.get("/api/me", headers={"x-authentik-username": "alice"})
-    assert response.status_code == status.HTTP_200_OK, response.text
-    assert response.json()["username"] == "alice"
-    assert "access_token=" in response.headers.get("set-cookie", "")
-
-    # TestClient stores the new cookie automatically, so the next request no
-    # longer needs the trusted header.
-    follow_up = app_client.get("/api/me")
-    assert follow_up.status_code == status.HTTP_200_OK
-    assert follow_up.json()["username"] == "alice"
 
 
-def test_me_trusted_header_requires_provisioned_local_user(app_client):
-    """The forwarded identity must map onto an existing s3manager row; fail
-    closed rather than auto-creating users with unknown roles."""
-    response = app_client.get("/api/me", headers={"x-authentik-username": "ghost"})
-    assert response.status_code == status.HTTP_403_FORBIDDEN
-    assert "not provisioned" in response.json()["detail"]
-    assert "access_token=" not in response.headers.get("set-cookie", "")
 
 
-def test_me_keeps_existing_local_session_over_trusted_header(app_client):
-    """A deliberate local login (e.g. admin) must not be silently overwritten
-    by the gateway username on the next /api/me poll."""
-    create_user("alice", password="alicepass", is_admin=False)
-    login(app_client, username="admin", password="admin123")
-
-    response = app_client.get("/api/me", headers={"x-authentik-username": "alice"})
-    assert response.status_code == status.HTTP_200_OK
-    assert response.json()["username"] == "admin"
 
 
 def test_get_app_info(app_client):
@@ -406,166 +205,26 @@ def test_get_app_info(app_client):
     assert data["app_version"] == _constants_module.APP_VERSION
 
 
-def test_list_users_requires_admin(app_client):
-    create_user("user", is_admin=False)
-    data, headers = login(app_client)
-    # Switch the active cookie to the regular user — TestClient's cookie jar
-    # auto-replaces the access_token cookie from the new login's Set-Cookie.
-    create_user("regular", is_admin=False)
-    response = app_client.post("/api/login", data={"username": "regular", "password": "password"})
-    assert response.status_code == status.HTTP_200_OK
-    resp = app_client.get("/api/admin/users")
-    assert resp.status_code == status.HTTP_403_FORBIDDEN
 
 
-def test_list_users_as_admin(app_client):
-    create_user("user", is_admin=False)
-    _, headers = login(app_client)
-    response = app_client.get("/api/admin/users", headers=headers)
-    assert response.status_code == status.HTTP_200_OK
-    data = response.json()
-    assert "users" in data
-    assert any(u["username"] == "user" for u in data["users"])
 
 
-def test_create_user(app_client):
-    _, headers = login(app_client)
-    response = app_client.post(
-        "/api/admin/users",
-        data={
-            "username": "newuser",
-            "password": "NewPassword1",
-            "is_admin": "true",
-            "allowed_roles": "Default",
-        },
-        headers=headers,
-    )
-    assert response.status_code == status.HTTP_200_OK
-    data = response.json()
-    assert data["username"] == "newuser"
 
 
-def test_create_user_duplicate(app_client):
-    create_user("duplicate", is_admin=False)
-    _, headers = login(app_client)
-    response = app_client.post(
-        "/api/admin/users",
-        data={
-            "username": "duplicate",
-            "password": "password",
-            "is_admin": "false",
-        },
-        headers=headers,
-    )
-    assert response.status_code == status.HTTP_400_BAD_REQUEST
 
 
-def test_update_user_password(app_client):
-    create_user("changeme", is_admin=False)
-    _, headers = login(app_client)
-    response = app_client.put(
-        "/api/admin/users/changeme/password",
-        json={"password": "NewPass123"},
-        headers=headers,
-    )
-    assert response.status_code == status.HTTP_200_OK
 
 
-def test_update_user(app_client):
-    create_user("updateme", is_admin=False)
-    _, headers = login(app_client)
-    response = app_client.put(
-        "/api/admin/users/updateme",
-        data={"is_admin": "true", "allowed_roles": "Default"},
-        headers=headers,
-    )
-    assert response.status_code == status.HTTP_200_OK
 
 
-def test_update_user_theme(app_client):
-    create_user("themer", is_admin=False)
-    login_response = app_client.post("/api/login", data={"username": "themer", "password": "password"})
-    assert login_response.status_code == status.HTTP_200_OK
-    # Cookie set automatically by TestClient cookie jar; pull CSRF from /api/me.
-    csrf = app_client.get("/api/me").json()["csrf_token"]
-    headers = {"X-CSRF-Token": csrf}
-    response = app_client.put(
-        "/api/user/theme",
-        json={"theme": "light"},
-        headers=headers,
-    )
-    assert response.status_code == status.HTTP_200_OK
-    assert response.json()["theme"] == "light"
 
 
-def test_delete_user(app_client):
-    create_user("deleteme", is_admin=False)
-    _, headers = login(app_client)
-    response = app_client.delete("/api/admin/users/deleteme", headers=headers)
-    assert response.status_code == status.HTTP_200_OK
 
 
-def test_single_user_admin_routes_do_not_rewrite_the_whole_table(app_client, mocker):
-    """update_user_password, update_user, update_user_theme, and delete_user
-    each touch exactly one row. None of them should call save_users() (a
-    full-table load-and-rewrite) just to change or remove one user."""
-    create_user("targetuser", is_admin=False, allowed_roles=["Default"])
-    _, headers = login(app_client)
-
-    save_users_spy = mocker.patch("another_s3_manager.main.save_users", side_effect=AssertionError("must not run"))
-
-    resp = app_client.put(
-        "/api/admin/users/targetuser/password",
-        json={"password": "NewPass123"},
-        headers=headers,
-    )
-    assert resp.status_code == status.HTTP_200_OK
-
-    resp = app_client.put(
-        "/api/admin/users/targetuser",
-        data={"is_admin": "false", "allowed_roles": "Default"},
-        headers=headers,
-    )
-    assert resp.status_code == status.HTTP_200_OK
-
-    login_response = app_client.post("/api/login", data={"username": "targetuser", "password": "NewPass123"})
-    assert login_response.status_code == status.HTTP_200_OK
-    csrf = app_client.get("/api/me").json()["csrf_token"]
-    resp = app_client.put(
-        "/api/user/theme",
-        json={"theme": "dark"},
-        headers={"X-CSRF-Token": csrf},
-    )
-    assert resp.status_code == status.HTTP_200_OK
-
-    _, headers = login(app_client)
-    resp = app_client.delete("/api/admin/users/targetuser", headers=headers)
-    assert resp.status_code == status.HTTP_200_OK
-
-    save_users_spy.assert_not_called()
 
 
-def test_list_bans(app_client):
-    _, headers = login(app_client)
-    response = app_client.get("/api/admin/bans", headers=headers)
-    assert response.status_code == status.HTTP_200_OK
-    assert "bans" in response.json()
 
 
-def test_unban_user(app_client):
-    users_module = reload_users_module()
-    _, headers = login(app_client)
-
-    # User must exist for the ban FK to be honored
-    users_module.create_user(username="troublesome", password_hash="h")
-
-    auth_module = reload_auth_module()
-    for _ in range(auth_module.MAX_LOGIN_ATTEMPTS):
-        auth_module.record_login_attempt("troublesome", success=False)
-    assert "troublesome" in users_module.load_bans()
-    response = app_client.delete("/api/admin/bans/troublesome", headers=headers)
-    assert response.status_code == status.HTTP_200_OK
-    assert "troublesome" not in users_module.load_bans()
 
 
 def test_get_config_admin(app_client):
@@ -577,13 +236,6 @@ def test_get_config_admin(app_client):
     assert "is_read_only" in data
 
 
-def test_get_config_regular_user(app_client):
-    create_user("viewer", is_admin=False)
-    login_response = app_client.post("/api/login", data={"username": "viewer", "password": "password"})
-    assert login_response.status_code == status.HTTP_200_OK
-    response = app_client.get("/api/config")
-    assert response.status_code == status.HTTP_200_OK
-    assert "roles" in response.json()
 
 
 def test_export_config_admin(app_client):
@@ -594,12 +246,6 @@ def test_export_config_admin(app_client):
     assert "roles" in data
 
 
-def test_export_config_requires_admin(app_client):
-    create_user("viewer", is_admin=False)
-    login_response = app_client.post("/api/login", data={"username": "viewer", "password": "password"})
-    assert login_response.status_code == status.HTTP_200_OK
-    response = app_client.get("/api/config/export")
-    assert response.status_code == status.HTTP_403_FORBIDDEN
 
 
 def test_update_config(app_client):
@@ -974,131 +620,24 @@ def test_delete_file_not_found_returns_404_via_moto(app_client, moto_s3):
     assert remaining == {"unrelated.txt"}
 
 
-def test_login_user_not_found(app_client):
-    response = app_client.post(
-        "/api/login",
-        data={"username": "ghost", "password": "doesntmatter"},
-    )
-    assert response.status_code == status.HTTP_401_UNAUTHORIZED
 
 
-def test_login_handles_unexpected_error(app_client, mocker):
-    mocker.patch("another_s3_manager.main.get_user_by_username", side_effect=RuntimeError("boom"))
-    response = app_client.post(
-        "/api/login",
-        data={"username": "admin", "password": "admin123"},
-    )
-    assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
 
 
-def test_login_does_not_call_load_users_once_a_user_exists(app_client, mocker):
-    """login() must use the targeted get_user_by_username() lookup once the
-    users table is populated — load_users() is only a fallback for the
-    genuinely-empty-table bootstrap case (see login()'s count_users() guard)."""
-    load_users_spy = mocker.patch("another_s3_manager.main.load_users", side_effect=AssertionError("must not run"))
-    response = app_client.post(
-        "/api/login",
-        data={"username": "admin", "password": "admin123"},
-    )
-    assert response.status_code == status.HTTP_200_OK
-    load_users_spy.assert_not_called()
 
 
-def test_create_user_truncates_long_password(app_client):
-    _, headers = login(app_client)
-    # Strong prefix (upper, lower, digit, 8+ chars) + filler to exceed 72 bytes
-    long_password = "Strong1A" + "x" * 92
-    response = app_client.post(
-        "/api/admin/users",
-        data={"username": "truncate", "password": long_password},
-        headers=headers,
-    )
-    assert response.status_code == status.HTTP_200_OK
 
 
-def test_update_user_password_empty(app_client):
-    _, headers = login(app_client)
-    response = app_client.put(
-        "/api/admin/users/someone/password",
-        json={"password": ""},
-        headers=headers,
-    )
-    # Pydantic rejects empty string via min_length=1 before the handler runs.
-    assert response.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY
 
 
-def test_update_user_password_missing_user(app_client):
-    _, headers = login(app_client)
-    response = app_client.put(
-        "/api/admin/users/missing/password",
-        json={"password": "newpass"},
-        headers=headers,
-    )
-    assert response.status_code == status.HTTP_404_NOT_FOUND
 
 
-def test_update_user_not_found(app_client):
-    _, headers = login(app_client)
-    response = app_client.put(
-        "/api/admin/users/missing",
-        data={"is_admin": "true"},
-        headers=headers,
-    )
-    assert response.status_code == status.HTTP_404_NOT_FOUND
 
 
-def test_update_user_theme_invalid_value(app_client):
-    create_user("themer", is_admin=False)
-    login_response = app_client.post("/api/login", data={"username": "themer", "password": "password"})
-    assert login_response.status_code == status.HTTP_200_OK
-    csrf = app_client.get("/api/me").json()["csrf_token"]
-    headers = {"X-CSRF-Token": csrf}
-    response = app_client.put(
-        "/api/user/theme",
-        json={"theme": "blue"},
-        headers=headers,
-    )
-    assert response.status_code == status.HTTP_400_BAD_REQUEST
 
 
-def test_update_user_theme_user_missing(app_client, mocker):
-    _, headers = login(app_client)
-    mocker.patch("another_s3_manager.main.get_user_by_username", return_value=None)
-    response = app_client.put(
-        "/api/user/theme",
-        json={"theme": "light"},
-        headers=headers,
-    )
-    assert response.status_code == status.HTTP_404_NOT_FOUND
 
 
-def test_me_returns_allowed_roles(app_client, monkeypatch):
-    """/api/me must include allowed_roles for the React sidebar."""
-    monkeypatch.setenv("ADMIN_PASSWORD", "test-pw")
-    from another_s3_manager.auth import hash_password
-    from another_s3_manager.users import save_users
-
-    save_users(
-        {
-            "users": [
-                {
-                    "username": "alice",
-                    "password_hash": hash_password("test-pw"),
-                    "is_admin": False,
-                    "allowed_roles": ["aws-prod", "r2-cdn"],
-                    "theme": "auto",
-                }
-            ]
-        }
-    )
-
-    login_response = app_client.post("/api/login", data={"username": "alice", "password": "test-pw"})
-    assert login_response.status_code == 200, login_response.text
-
-    me_response = app_client.get("/api/me")
-    assert me_response.status_code == 200
-    body = me_response.json()
-    assert body["allowed_roles"] == ["aws-prod", "r2-cdn"]
 
 
 def test_me_admin_returns_all_config_roles(app_client, mocker):
@@ -1172,16 +711,8 @@ def test_me_disable_deletion_defaults_false(app_client, mocker, monkeypatch):
     assert app_client.get("/api/me").json()["disable_deletion"] is False
 
 
-def test_delete_user_cannot_delete_self(app_client):
-    _, headers = login(app_client)
-    response = app_client.delete("/api/admin/users/admin", headers=headers)
-    assert response.status_code == status.HTTP_400_BAD_REQUEST
 
 
-def test_unban_user_not_banned(app_client):
-    _, headers = login(app_client)
-    response = app_client.delete("/api/admin/bans/unknown", headers=headers)
-    assert response.status_code == status.HTTP_404_NOT_FOUND
 
 
 def test_get_config_admin_read_only(app_client, mocker):
@@ -1192,13 +723,6 @@ def test_get_config_admin_read_only(app_client, mocker):
     assert response.json()["is_read_only"] is True
 
 
-def test_get_config_regular_user_no_roles(app_client):
-    create_user("limited", is_admin=False, allowed_roles=[])
-    login_response = app_client.post("/api/login", data={"username": "limited", "password": "password"})
-    assert login_response.status_code == status.HTTP_200_OK
-    response = app_client.get("/api/config")
-    assert response.status_code == status.HTTP_200_OK
-    assert response.json()["roles"] == []
 
 
 def test_list_buckets_access_denied_returns_friendly_403(app_client, mocker):
@@ -1280,37 +804,8 @@ def test_delete_file_handles_error(app_client, mocker):
     assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
 
 
-def test_list_bans_includes_remaining_minutes(app_client, mocker):
-    _, headers = login(app_client)
-    now = time.time()
-    mocker.patch(
-        "another_s3_manager.main.load_bans",
-        return_value={
-            "trouble": {
-                "banned_until": now + 120,
-                "banned_at": now,
-                "reason": "testing",
-            }
-        },
-    )
-    response = app_client.get("/api/admin/bans", headers=headers)
-    assert response.status_code == status.HTTP_200_OK
-    data = response.json()["bans"][0]
-    assert data["remaining_minutes"] >= 1
 
 
-def test_update_config_requires_admin(app_client):
-    create_user("viewer", is_admin=False)
-    login_response = app_client.post("/api/login", data={"username": "viewer", "password": "password"})
-    assert login_response.status_code == status.HTTP_200_OK
-    csrf = app_client.get("/api/me").json()["csrf_token"]
-    headers = {"X-CSRF-Token": csrf}
-    response = app_client.post(
-        "/api/config",
-        json={"roles": []},
-        headers=headers,
-    )
-    assert response.status_code == status.HTTP_403_FORBIDDEN
 
 
 def test_update_config_read_only(app_client, mocker):
@@ -1580,12 +1075,6 @@ async def test_list_files_invalid_path():
     assert exc.value.status_code == status.HTTP_400_BAD_REQUEST
 
 
-def test_validate_role_access_denied():
-    create_user("limited", is_admin=False, allowed_roles=["Other"])
-    module = reload_main()
-    with pytest.raises(HTTPException) as exc:
-        module.validate_role_access("Default", {"username": "limited", "is_admin": False})
-    assert exc.value.status_code == status.HTTP_403_FORBIDDEN
 
 
 @pytest.mark.parametrize("raw_path", ["", "/", "//", "  /  ", "../"])
@@ -1635,58 +1124,6 @@ def test_delete_file_disabled(app_client, mocker):
     assert response.status_code == status.HTTP_403_FORBIDDEN
 
 
-def test_startup_runs_migrations_and_json_import(monkeypatch, tmp_path):
-    """At startup, app runs alembic upgrade head and migrates JSON if needed."""
-    monkeypatch.setenv("DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("JWT_SECRET_KEY", "test-secret-key")
-
-    import importlib
-
-    from another_s3_manager import constants, database
-
-    importlib.reload(constants)
-    importlib.reload(database)
-    database.reset_engine_for_tests()
-
-    # Seed a JSON file
-    import json
-
-    (tmp_path / "users.json").write_text(
-        json.dumps(
-            {
-                "users": [
-                    {
-                        "username": "imported",
-                        "password_hash": "h",
-                        "is_admin": False,
-                        "allowed_roles": [],
-                        "theme": "auto",
-                    }
-                ]
-            }
-        )
-    )
-
-    # Phase 5 lifespan refactor: startup is now part of the FastAPI lifespan
-    # context manager rather than a standalone async function. Drive the same
-    # behavior by entering the lifespan via TestClient — TestClient runs the
-    # lifespan handler on enter (and exits it on close).
-    from fastapi.testclient import TestClient
-
-    from another_s3_manager.main import app
-
-    with TestClient(app) as _client:
-        # Lifespan startup runs synchronously before this block executes;
-        # by the time we're here, alembic + JSON migration have completed.
-        pass
-
-    # DB exists, has the imported user, JSON renamed
-    assert (tmp_path / "another_s3_manager.db").exists()
-    assert (tmp_path / "users.json.migrated.bak").exists()
-
-    from another_s3_manager.users import get_user_by_username
-
-    assert get_user_by_username("imported") is not None
 
 
 def test_run_alembic_upgrade_preserves_the_alembic_ini_section(monkeypatch):
@@ -1791,181 +1228,6 @@ def test_download_file_with_colon_in_key(app_client, moto_s3):
     assert response.content == file_content
 
 
-def test_admin_cannot_demote_self(app_client):
-    """An admin trying to set their own is_admin=False must be rejected."""
-    _, headers = login(app_client)  # logged in as admin (default seeded admin)
-    response = app_client.put(
-        "/api/admin/users/admin",
-        data={"is_admin": "false", "allowed_roles": ""},
-        headers=headers,
-    )
-    assert response.status_code == status.HTTP_400_BAD_REQUEST
-    assert "own admin rights" in response.json()["detail"].lower()
-
-
-def test_admin_can_demote_other_admin(app_client):
-    """Defensive: the self-demote guard must NOT block demoting OTHER admins."""
-    create_user("co_admin", is_admin=True, allowed_roles=[])
-    _, headers = login(app_client)
-    response = app_client.put(
-        "/api/admin/users/co_admin",
-        data={"is_admin": "false", "allowed_roles": ""},
-        headers=headers,
-    )
-    assert response.status_code == status.HTTP_200_OK
-    # Verify the other admin really lost the flag
-    users_module = reload_users_module()
-    co = next(u for u in users_module.load_users()["users"] if u["username"] == "co_admin")
-    assert co["is_admin"] is False
-
-
-# ---------------------------------------------------------------------------
-# PUT /api/me/password — self-service password change
-# ---------------------------------------------------------------------------
-
-
-def test_change_my_password_success(app_client):
-    """Happy path: user changes own password, old fails, new works."""
-    create_user("alice", password="OldPass123")
-    # Login as alice and grab CSRF
-    login_resp = app_client.post("/api/login", data={"username": "alice", "password": "OldPass123"})
-    assert login_resp.status_code == status.HTTP_200_OK
-    csrf = app_client.get("/api/me").json()["csrf_token"]
-    headers = {"X-CSRF-Token": csrf}
-
-    # Change password
-    response = app_client.put(
-        "/api/me/password",
-        json={"current_password": "OldPass123", "new_password": "NewPass456"},
-        headers=headers,
-    )
-    assert response.status_code == status.HTTP_200_OK, response.text
-    assert response.json() == {"ok": True}
-
-    # Logout (clear cookie jar)
-    app_client.post("/api/logout")
-    app_client.cookies.clear()
-
-    # Old password no longer works
-    bad = app_client.post("/api/login", data={"username": "alice", "password": "OldPass123"})
-    assert bad.status_code == status.HTTP_401_UNAUTHORIZED
-
-    # New password works
-    good = app_client.post("/api/login", data={"username": "alice", "password": "NewPass456"})
-    assert good.status_code == status.HTTP_200_OK
-
-
-def test_change_my_password_wrong_current(app_client):
-    """Wrong current_password → 401 with detail mentioning 'current password'."""
-    create_user("bob", password="bobpass")
-    login_resp = app_client.post("/api/login", data={"username": "bob", "password": "bobpass"})
-    assert login_resp.status_code == status.HTTP_200_OK
-    csrf = app_client.get("/api/me").json()["csrf_token"]
-    headers = {"X-CSRF-Token": csrf}
-
-    response = app_client.put(
-        "/api/me/password",
-        json={"current_password": "wrong", "new_password": "newpass"},
-        headers=headers,
-    )
-    assert response.status_code == status.HTTP_401_UNAUTHORIZED
-    assert "current password" in response.json()["detail"].lower()
-
-
-def test_change_my_password_same_password(app_client):
-    """new_password equal to current_password → 400 with detail mentioning 'differ'."""
-    create_user("carol", password="samepass")
-    login_resp = app_client.post("/api/login", data={"username": "carol", "password": "samepass"})
-    assert login_resp.status_code == status.HTTP_200_OK
-    csrf = app_client.get("/api/me").json()["csrf_token"]
-    headers = {"X-CSRF-Token": csrf}
-
-    response = app_client.put(
-        "/api/me/password",
-        json={"current_password": "samepass", "new_password": "samepass"},
-        headers=headers,
-    )
-    assert response.status_code == status.HTTP_400_BAD_REQUEST
-    assert "differ" in response.json()["detail"].lower()
-
-
-def test_change_my_password_unauthenticated(app_client):
-    """No auth cookie → 401 (get_current_user runs before CSRF check)."""
-    response = app_client.put(
-        "/api/me/password",
-        json={"current_password": "x", "new_password": "y"},
-    )
-    assert response.status_code == status.HTTP_401_UNAUTHORIZED
-
-
-def test_change_my_password_no_csrf(app_client):
-    """Logged in but no X-CSRF-Token header → 403."""
-    create_user("dave", password="davepass")
-    login_resp = app_client.post("/api/login", data={"username": "dave", "password": "davepass"})
-    assert login_resp.status_code == status.HTTP_200_OK
-
-    response = app_client.put(
-        "/api/me/password",
-        json={"current_password": "davepass", "new_password": "newpass"},
-    )
-    assert response.status_code == status.HTTP_403_FORBIDDEN
-
-
-def test_admin_can_clear_user_allowed_roles(app_client):
-    """Regression: PUT /api/admin/users/{u} with allowed_roles= must clear all roles.
-
-    FastAPI's `Optional[str] = Form(None)` coerces empty form values to None,
-    making it impossible to distinguish 'field omitted' from 'field present
-    but empty'. The endpoint reads request.form() directly and treats
-    presence-of-key as 'client wants to set roles'.
-    """
-    create_user("alice", password="OldPass123", is_admin=False, allowed_roles=["RoleA", "RoleB"])
-    _, headers = login(app_client)
-    response = app_client.put(
-        "/api/admin/users/alice",
-        data={"is_admin": "false", "allowed_roles": ""},
-        headers=headers,
-    )
-    assert response.status_code == 200, response.text
-
-    users = app_client.get("/api/admin/users", headers=headers).json()["users"]
-    alice = next(u for u in users if u["username"] == "alice")
-    assert alice["allowed_roles"] == [], f"expected [], got {alice['allowed_roles']}"
-
-
-def test_admin_can_partially_update_user_omitting_roles(app_client):
-    """If allowed_roles key is absent, existing roles must be preserved."""
-    create_user("alice", password="OldPass123", is_admin=False, allowed_roles=["RoleA"])
-    _, headers = login(app_client)
-    # Send only is_admin, no allowed_roles field at all
-    response = app_client.put("/api/admin/users/alice", data={"is_admin": "true"}, headers=headers)
-    assert response.status_code == 200
-
-    users = app_client.get("/api/admin/users", headers=headers).json()["users"]
-    alice = next(u for u in users if u["username"] == "alice")
-    assert alice["is_admin"] is True
-    assert alice["allowed_roles"] == ["RoleA"], "roles must be preserved when key absent"
-
-
-def test_admin_empty_is_admin_field_does_not_demote_target(app_client):
-    """Regression: PUT /api/admin/users/{u} with is_admin= (empty value) must NOT
-    silently demote the target. FastAPI form parsing returns empty string (not None)
-    for an empty multipart field, so a naive `is not None` guard wrongly evaluates
-    str("") .lower() != "true" → False and clears admin rights for ANY non-self
-    administrator. This was a curl/Postman exploit before the fix.
-    """
-    create_user("other_admin", password="OldPass123", is_admin=True, allowed_roles=[])
-    _, headers = login(app_client)
-    response = app_client.put(
-        "/api/admin/users/other_admin",
-        data={"is_admin": "", "allowed_roles": ""},
-        headers=headers,
-    )
-    assert response.status_code == 200, response.text
-
-    users = app_client.get("/api/admin/users", headers=headers).json()["users"]
-    other = next(u for u in users if u["username"] == "other_admin")
-    assert other["is_admin"] is True, "target admin must NOT be demoted on empty is_admin="
 
 
 # ---------------------------------------------------------------------------
@@ -2607,104 +1869,10 @@ def test_delete_generic_exception_returns_structured_500(app_client, mocker):
     assert resp.json()["detail"] == {"code": "INTERNAL", "message": "Delete failed — see server logs"}
 
 
-def test_get_user_for_download_does_not_swallow_db_errors(monkeypatch):
-    """A non-JWT exception (e.g. SQLite OperationalError) during user lookup
-    must NOT be silently swallowed and turned into 401 — it should propagate."""
-    # Create a valid JWT for "alice".
-    from datetime import datetime, timedelta, timezone
-
-    from jose import jwt
-    from sqlalchemy.exc import OperationalError
-
-    from another_s3_manager.auth import get_jwt_secret_key
-    from another_s3_manager.constants import JWT_ALGORITHM
-    from another_s3_manager.main import get_user_for_download
-
-    payload = {
-        "sub": "alice",
-        "csrf_token": "csrf-x",
-        "exp": datetime.now(timezone.utc) + timedelta(hours=1),
-    }
-    token = jwt.encode(payload, get_jwt_secret_key(), algorithm=JWT_ALGORITHM)
-
-    # Patch get_user_by_username to raise OperationalError (transient DB
-    # error). The function imports it INSIDE its body, so patch the source
-    # module.
-    import another_s3_manager.users as users_module
-
-    def _boom(username):
-        raise OperationalError("statement", "params", Exception("db down"))
-
-    monkeypatch.setattr(users_module, "get_user_by_username", _boom)
-
-    # Old behaviour: silent catch → returns 401.
-    # New behaviour: re-raise OperationalError (transient infra → caller sees real error).
-    with pytest.raises(OperationalError):
-        get_user_for_download(token=token, request=None)
 
 
-def test_get_user_for_download_never_calls_load_users(monkeypatch):
-    """get_user_for_download runs on every download request. It must use the
-    targeted get_user_by_username() lookup, not load_users() (which would
-    load every user row plus a roles join just to find the one downloading)."""
-    from datetime import datetime, timedelta, timezone
-
-    from jose import jwt
-
-    from another_s3_manager.auth import get_jwt_secret_key
-    from another_s3_manager.constants import JWT_ALGORITHM
-    from another_s3_manager.main import get_user_for_download
-    from another_s3_manager.users import create_user
-
-    create_user(username="bob", password_hash="x")
-
-    payload = {
-        "sub": "bob",
-        "csrf_token": "csrf-x",
-        "exp": datetime.now(timezone.utc) + timedelta(hours=1),
-    }
-    token = jwt.encode(payload, get_jwt_secret_key(), algorithm=JWT_ALGORITHM)
-
-    import another_s3_manager.users as users_module
-
-    def _boom():
-        raise AssertionError("get_user_for_download must not call load_users()")
-
-    monkeypatch.setattr(users_module, "load_users", _boom)
-
-    user = get_user_for_download(token=token, request=None)
-    assert user["username"] == "bob"
 
 
-def test_get_config_exposes_extension_lists_for_non_admin(app_client):
-    """A non-admin /api/config response includes both extension lists.
-
-    /v2 FileRow/FileCard/PreviewModal read preview_text_extensions via useConfig
-    to decide which text files are previewable.
-    """
-    import another_s3_manager.config as config_module
-
-    cfg = config_module.load_config(force_reload=True)
-    cfg["preview_text_extensions"] = ["ts", "tsx"]
-    cfg["upload_inline_extensions"] = ["pdf"]
-    config_module.save_config(cfg)
-
-    # Non-admin user with no allowed roles (exercises the no-allowed-roles return dict).
-    create_user("noroler", is_admin=False, allowed_roles=[])
-    login_response = app_client.post("/api/login", data={"username": "noroler", "password": "password"})
-    assert login_response.status_code == status.HTTP_200_OK
-    response_no_roles = app_client.get("/api/config")
-    assert response_no_roles.status_code == 200
-    assert response_no_roles.json()["preview_text_extensions"] == ["ts", "tsx"]
-    assert response_no_roles.json()["upload_inline_extensions"] == ["pdf"]
-
-    # Non-admin user with an allowed role (exercises the regular-user return dict).
-    create_user("roler", is_admin=False, allowed_roles=["Default"])
-    login_response2 = app_client.post("/api/login", data={"username": "roler", "password": "password"})
-    assert login_response2.status_code == status.HTTP_200_OK
-    response_with_roles = app_client.get("/api/config")
-    assert response_with_roles.status_code == 200
-    assert response_with_roles.json()["preview_text_extensions"] == ["ts", "tsx"]
 
 
 def test_clearing_extension_lists_persists_across_reload(app_client):

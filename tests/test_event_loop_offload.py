@@ -105,8 +105,12 @@ async def test_list_buckets_offload_keeps_health_responsive(app_client, monkeypa
 
     transport = httpx.ASGITransport(app=main.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-        login_resp = await client.post("/api/login", data={"username": "admin", "password": "admin123"})
-        assert login_resp.status_code == 200
+        gateway = {
+            "x-authentik-username": "admin",
+            "x-authentik-groups": "admin",
+        }
+        me = await client.get("/api/me", headers=gateway)
+        assert me.status_code == 200
 
         t0 = time.perf_counter()
         poll_elapsed: list[float] = []
@@ -126,7 +130,7 @@ async def test_list_buckets_offload_keeps_health_responsive(app_client, monkeypa
         # The slow request, awaited INLINE (not create_task'd) — see the
         # docstring above for why this ordering is what makes the test
         # trustworthy.
-        slow_resp = await client.get("/api/buckets")
+        slow_resp = await client.get("/api/buckets", headers=gateway)
 
         stop.set()
         await poller_task

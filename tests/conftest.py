@@ -192,13 +192,11 @@ def mock_boto3_client(mocker, fake_s3_client):
 
 @pytest.fixture
 def valid_user_dict():
-    """Plain user dict suitable for stubbing load_users in auth tests."""
-    from another_s3_manager.auth import hash_password
-
+    """Ephemeral principal shape (gateway auth); password_hash unused."""
     return {
         "username": "testuser",
-        "password_hash": hash_password("testpass"),
         "is_admin": False,
+        "allowed_roles": [],
         "theme": "auto",
     }
 

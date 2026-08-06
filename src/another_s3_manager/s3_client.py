@@ -975,8 +975,11 @@ def role_allowed_buckets(role_config: Dict[str, Any], config: Dict[str, Any]) ->
     ``shared_bucket`` (one-bucket + prefixes model). ``None`` means "list via S3".
     """
     allowed_buckets = role_config.get("allowed_buckets")
-    if isinstance(allowed_buckets, list) and allowed_buckets:
-        return allowed_buckets
+    if allowed_buckets is not None:
+        if not isinstance(allowed_buckets, list):
+            raise ValueError("allowed_buckets must be a list")
+        if allowed_buckets:
+            return allowed_buckets
     shared = config.get("shared_bucket")
     if isinstance(shared, str) and shared.strip():
         return [shared.strip()]

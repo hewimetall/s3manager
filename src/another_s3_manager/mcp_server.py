@@ -966,12 +966,12 @@ async def bucket_summary(
         config = _config_module.load_config(force_reload=False)
         max_keys = int(config.get("mcp_summary_max_keys", 50_000))
         prefix_scan_pages = int(config.get("mcp_summary_prefix_scan_pages", 20))
-        # ACL on RAW path first — stripping must not mint access to a foreign prefix.
-        _s3_client.validate_storage_access(role, bucket, user, object_key=path)
-        prefix = path.strip("/")
-        if prefix:
-            prefix += "/"
         try:
+            # ACL on RAW path first — stripping must not mint access to a foreign prefix.
+            _s3_client.validate_storage_access(role, bucket, user, object_key=path)
+            prefix = path.strip("/")
+            if prefix:
+                prefix += "/"
             result = await run_in_threadpool(
                 _s3_client.summarize_bucket_for_role,
                 role,

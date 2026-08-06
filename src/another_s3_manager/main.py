@@ -63,6 +63,7 @@ from another_s3_manager.constants import (
     PRESIGNED_URL_MIN_TTL,
     STATIC_DIR,
 )
+from another_s3_manager.api_tokens import count_active_tokens
 from another_s3_manager.errors import S3OperationError
 from another_s3_manager.metrics import (
     REGISTRY,
@@ -70,6 +71,7 @@ from another_s3_manager.metrics import (
     http_request_duration_seconds,
     http_requests_in_flight,
     http_requests_total,
+    mcp_active_tokens,
     roles_gauge,
     upload_rejected_total,
 )
@@ -527,6 +529,8 @@ def _check_metrics_auth(request: Request) -> None:
 # mutation) means the gauge can never drift out of sync with its source of truth
 # (the database, or config.json for roles_gauge).
 roles_gauge.set_function(lambda: float(len(load_config(force_reload=False).get("roles", []))))
+# MCP Bearer tokens still live in api_tokens even after local login removal.
+mcp_active_tokens.set_function(lambda: float(count_active_tokens()))
 
 # Pre-create fixed-enum counter series at 0 so the very first real increment
 # is visible to Grafana's increase()/rate() panels (see metrics.py's

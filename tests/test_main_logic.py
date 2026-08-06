@@ -106,59 +106,25 @@ async def test_get_config_non_admin_filters_roles(monkeypatch, reload_main):
 
     patch_load_config(monkeypatch, main, base_config)
 
-    user_dict = {
-        "username": "demo",
-        "allowed_roles": ["RoleB"],
-    }
-
-    monkeypatch.setattr(main, "get_user_by_username", lambda username: copy.deepcopy(user_dict))
-
-    result = await main.get_config(False, {"username": "demo", "is_admin": False})
+    result = await main.get_config(
+        False, {"username": "demo", "is_admin": False, "allowed_roles": ["RoleB"]}
+    )
 
     assert result["roles"] == [{"name": "RoleB", "type": "credentials", "access_key_id": "AKIA1098765432ZYXW10"}]
     assert result["current_role"] == "RoleB"
     assert result["max_file_size"] == 1234
 
 
-@pytest.mark.asyncio
-async def test_get_config_user_missing(monkeypatch, reload_main):
-    main = reload_main
-
-    base_config = {
-        "roles": [],
-    }
-
-    patch_load_config(monkeypatch, main, base_config)
-    monkeypatch.setattr(main, "get_user_by_username", lambda username: None)
-
-    with pytest.raises(HTTPException) as exc:
-        await main.get_config(False, {"username": "ghost", "is_admin": False})
-    assert exc.value.status_code == 404
-
 
 def test_validate_role_access_denied(monkeypatch, reload_main):
     main = reload_main
 
-    user_dict = {
-        "username": "demo",
-        "allowed_roles": ["RoleA"],
-    }
-
-    monkeypatch.setattr(main, "get_user_by_username", lambda username: copy.deepcopy(user_dict))
-
     with pytest.raises(HTTPException) as exc:
-        main.validate_role_access("RoleB", {"username": "demo", "is_admin": False})
+        main.validate_role_access(
+            "RoleB", {"username": "demo", "is_admin": False, "allowed_roles": ["RoleA"]}
+        )
     assert exc.value.status_code == 403
 
-
-def test_validate_role_access_user_missing(monkeypatch, reload_main):
-    main = reload_main
-
-    monkeypatch.setattr(main, "get_user_by_username", lambda username: None)
-
-    with pytest.raises(HTTPException) as exc:
-        main.validate_role_access("RoleA", {"username": "demo", "is_admin": False})
-    assert exc.value.status_code == 404
 
 
 def test_validate_role_access_admin_allows_any(monkeypatch, reload_main):
@@ -176,31 +142,13 @@ def test_validate_role_access_none(monkeypatch, reload_main):
 def test_validate_role_access_allowed(monkeypatch, reload_main):
     main = reload_main
 
-    user_dict = {
-        "username": "demo",
-        "allowed_roles": ["RoleA"],
-    }
+    assert (
+        main.validate_role_access(
+            "RoleA", {"username": "demo", "is_admin": False, "allowed_roles": ["RoleA"]}
+        )
+        == "RoleA"
+    )
 
-    monkeypatch.setattr(main, "get_user_by_username", lambda username: copy.deepcopy(user_dict))
-
-    assert main.validate_role_access("RoleA", {"username": "demo", "is_admin": False}) == "RoleA"
-
-
-def test_validate_role_access_never_calls_load_users(monkeypatch, reload_main):
-    """validate_role_access runs on most bucket/file requests for non-admin
-    users. Assert it uses the targeted get_user_by_username() lookup instead
-    of loading every user row via load_users()."""
-    main = reload_main
-
-    user_dict = {"username": "demo", "allowed_roles": ["RoleA"]}
-    monkeypatch.setattr(main, "get_user_by_username", lambda username: copy.deepcopy(user_dict))
-
-    def _boom():
-        raise AssertionError("validate_role_access must not call load_users()")
-
-    monkeypatch.setattr(main, "load_users", _boom)
-
-    assert main.validate_role_access("RoleA", {"username": "demo", "is_admin": False}) == "RoleA"
 
 
 @pytest.mark.asyncio

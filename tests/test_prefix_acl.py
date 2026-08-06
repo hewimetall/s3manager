@@ -120,43 +120,48 @@ def test_validate_storage_access_allow_and_deny(prefix_config):
 
 
 def test_rest_and_mcp_doors(prefix_config):
-    """REST + MCP allow/deny in ONE TestClient (MCP session manager is one-shot)."""
+    """REST + MCP allow/deny without re-entering the MCP session-manager lifespan.
+
+    Other MCP tests may already have run ``StreamableHTTPSessionManager.run()``
+    on the process-wide app; a second ``with TestClient(app)`` would raise.
+    REST checks use a non-lifespan TestClient; MCP tools are invoked directly.
+    """
     from another_s3_manager.main import app
     from another_s3_manager.mcp_server import McpError, _current_request, mcp
 
-    with TestClient(app) as client:
+    client = TestClient(app)
 
-        def files(path: str, headers=DAYANA_HDR, role="dayana"):
-            return client.get(
-                f"/api/buckets/{SHARED}/files",
-                params={"role": role, "path": path},
-                headers=headers,
-            )
+    def files(path: str, headers=DAYANA_HDR, role="dayana"):
+        return client.get(
+            f"/api/buckets/{SHARED}/files",
+            params={"role": role, "path": path},
+            headers=headers,
+        )
 
-        with patch("another_s3_manager.s3_client.execute_with_s3_retry", return_value=[]):
-            ok = files("stand-dayana")
-            assert ok.status_code == 200, ok.text
+    with patch("another_s3_manager.s3_client.execute_with_s3_retry", return_value=[]):
+        ok = files("stand-dayana")
+        assert ok.status_code == 200, ok.text
 
-        for path, label in [
-            ("stand-dayna", "foreign"),
-            ("stand-dayana-evil", "spoof"),
-            ("", "root"),
-            ("../stand-dayana", "traversal"),
-            ("/stand-dayana", "absolute"),
-        ]:
-            denied = files(path)
-            assert denied.status_code in (400, 403), (
-                f"{label} path={path!r} -> {denied.status_code} {denied.text}"
-            )
+    for path, label in [
+        ("stand-dayna", "foreign"),
+        ("stand-dayana-evil", "spoof"),
+        ("", "root"),
+        ("../stand-dayana", "traversal"),
+        ("/stand-dayana", "absolute"),
+    ]:
+        denied = files(path)
+        assert denied.status_code in (400, 403), (
+            f"{label} path={path!r} -> {denied.status_code} {denied.text}"
+        )
 
-        no_groups = client.get("/api/me", headers=NO_GROUP_HDR)
-        assert no_groups.status_code == 200
-        assert no_groups.json()["allowed_roles"] == []
-        assert files("stand-dayana", headers=NO_GROUP_HDR).status_code in (401, 403)
+    no_groups = client.get("/api/me", headers=NO_GROUP_HDR)
+    assert no_groups.status_code == 200
+    assert no_groups.json()["allowed_roles"] == []
+    assert files("stand-dayana", headers=NO_GROUP_HDR).status_code in (401, 403)
 
-        with patch("another_s3_manager.s3_client.execute_with_s3_retry", return_value=[]):
-            admin_root = files("", headers=ADMIN_HDR, role="timeweb")
-            assert admin_root.status_code == 200, admin_root.text
+    with patch("another_s3_manager.s3_client.execute_with_s3_retry", return_value=[]):
+        admin_root = files("", headers=ADMIN_HDR, role="timeweb")
+        assert admin_root.status_code == 200, admin_root.text
 
     # MCP tools (no second TestClient lifespan)
     tool_registry = {tool.name: tool.fn for tool in mcp._tool_manager._tools.values()}
