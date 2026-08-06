@@ -696,6 +696,16 @@ def get_s3_client(role_name: Optional[str] = None) -> AnyType:
             typed = classify_boto_error(probe_error)
             if isinstance(typed, S3AccessDeniedError):
                 allowed_buckets = role.get("allowed_buckets") or []
+                if not allowed_buckets:
+                    shared = None
+                    try:
+                        from another_s3_manager.config import load_config
+
+                        shared = load_config(force_reload=False).get("shared_bucket")
+                    except Exception:
+                        shared = None
+                    if isinstance(shared, str) and shared.strip():
+                        allowed_buckets = [shared.strip()]
                 if isinstance(allowed_buckets, list) and allowed_buckets:
                     # Try each allowed bucket until one succeeds. As long as at
                     # least ONE responds, the credentials are valid — cache the
@@ -958,28 +968,121 @@ def validate_role_access(role_name: Optional[str], user_dict: Dict[str, Any]) ->
     return resolved_role
 
 
-def _validate_bucket_access(role: str, bucket: str, user_dict: Dict[str, Any]) -> None:
-    """
-    Validate role access and bucket access in one call.
+def role_allowed_buckets(role_config: Dict[str, Any], config: Dict[str, Any]) -> Optional[list]:
+    """Buckets a role may touch.
 
-    Raises PermissionError if the user cannot use `role` OR if `bucket`
-    is not in the role's allowed_buckets (when that list is configured).
+    Explicit ``allowed_buckets`` wins. Otherwise fall back to top-level
+    ``shared_bucket`` (one-bucket + prefixes model). ``None`` means "list via S3".
     """
-    # Role-level check (raises PermissionError if not allowed).
+    allowed_buckets = role_config.get("allowed_buckets")
+    if isinstance(allowed_buckets, list) and allowed_buckets:
+        return allowed_buckets
+    shared = config.get("shared_bucket")
+    if isinstance(shared, str) and shared.strip():
+        return [shared.strip()]
+    return None
+
+
+def role_allowed_prefixes(role_config: Dict[str, Any]) -> Optional[list]:
+    """Return configured prefixes, or None when the role is legacy (bucket-only).
+
+    An empty list is fail-closed: every object key is denied.
+    """
+    prefixes = role_config.get("allowed_prefixes")
+    if prefixes is None:
+        return None
+    if not isinstance(prefixes, list):
+        raise PermissionError("allowed_prefixes must be a list")
+    return prefixes
+
+
+def normalize_access_key(raw: Optional[str]) -> str:
+    """Normalize an S3 key/path for ACL checks. Rejects traversal and absolute forms."""
+    if raw is None or raw == "":
+        return ""
+    if "://" in raw:
+        raise PermissionError("Access denied: absolute or URI keys are not allowed")
+    from another_s3_manager.utils import sanitize_path
+
+    try:
+        return sanitize_path(raw)
+    except ValueError as exc:
+        # Path traversal / leading slash / controls — same door as prefix denial.
+        raise PermissionError(f"Access denied: {exc}") from exc
+
+
+def key_within_allowed_prefix(key: str, allowed_prefix: str) -> bool:
+    """Exact segment-boundary match — not substring.
+
+    ``stand-dayana/`` allows ``stand-dayana`` and ``stand-dayana/foo``.
+    It rejects ``stand-dayana-evil/``, ``stand-dayna/``, and bucket root (``\"\"``).
+    """
+    prefix = (allowed_prefix or "").strip()
+    if not prefix:
+        return False
+    if not prefix.endswith("/"):
+        prefix = prefix + "/"
+    if key == "":
+        return False
+    if key == prefix[:-1]:
+        return True
+    return key.startswith(prefix)
+
+
+def validate_storage_access(
+    role: Optional[str],
+    bucket: str,
+    user_dict: Dict[str, Any],
+    object_key: str = "",
+) -> Optional[str]:
+    """Single access gate for REST and MCP.
+
+    Checks, in order:
+      1. role membership (``validate_role_access``);
+      2. bucket ∈ role's allowed_buckets / shared_bucket;
+      3. if the role has ``allowed_prefixes``, ``object_key`` must sit under one
+         of them with exact prefix-boundary semantics.
+
+    Roles without ``allowed_prefixes`` keep legacy bucket-only isolation so
+    existing per-stand buckets stay usable until those stands are recreated.
+
+    Raises PermissionError on any denial. Returns the validated role name.
+    """
     validated_role = validate_role_access(role, user_dict)
 
-    # Bucket-level check.
     from another_s3_manager.config import load_config
 
     config = load_config(force_reload=False)
     roles = config.get("roles", [])
     role_config = next((r for r in roles if r.get("name") == validated_role), None)
     if role_config is None:
-        # Role not found in config — s3_client.get_s3_client will raise ValueError later.
-        return
-    allowed_buckets = role_config.get("allowed_buckets")
-    if allowed_buckets and bucket not in allowed_buckets:
+        # Unknown role — get_s3_client raises later; admin may omit role_name.
+        return validated_role
+
+    allowed_buckets = role_allowed_buckets(role_config, config)
+    if allowed_buckets is not None and bucket not in allowed_buckets:
         raise PermissionError(f"bucket '{bucket}' not in allowed_buckets for role '{validated_role}'")
+
+    prefixes = role_allowed_prefixes(role_config)
+    if prefixes is not None:
+        key = normalize_access_key(object_key)
+        if not any(key_within_allowed_prefix(key, p) for p in prefixes):
+            raise PermissionError(
+                f"prefix access denied: key '{object_key}' not under allowed_prefixes "
+                f"for role '{validated_role}'"
+            )
+
+    return validated_role
+
+
+def _validate_bucket_access(
+    role: str,
+    bucket: str,
+    user_dict: Dict[str, Any],
+    object_key: str = "",
+) -> None:
+    """Backward-compatible wrapper — prefer ``validate_storage_access``."""
+    validate_storage_access(role, bucket, user_dict, object_key=object_key)
 
 
 # Role types that sign with temporary (STS) credentials — a presigned URL
@@ -1021,11 +1124,12 @@ def list_buckets_for_role(role: str, user_dict: Dict[str, Any]) -> list:
         else (roles[0] if roles else None)
     )
 
-    if role_config and "allowed_buckets" in role_config and role_config["allowed_buckets"]:
-        allowed_buckets = role_config["allowed_buckets"]
-        if isinstance(allowed_buckets, list):
+    if role_config:
+        allowed_buckets = role_allowed_buckets(role_config, config)
+        if allowed_buckets is not None:
+            if not isinstance(allowed_buckets, list):
+                raise ValueError("allowed_buckets must be a list")
             return allowed_buckets
-        raise ValueError("allowed_buckets must be a list")
 
     def fetch_buckets(s3_client):
         response = s3_client.list_buckets()
@@ -1041,8 +1145,7 @@ def list_objects_for_role(role: str, bucket: str, path: str, user_dict: Dict[str
     Returns list of file-object dicts (same shape as /api/buckets/{b}/files).
     Raises PermissionError on role/bucket access violation.
     """
-    _validate_bucket_access(role, bucket, user_dict)
-    validated_role = validate_role_access(role, user_dict)
+    validated_role = validate_storage_access(role, bucket, user_dict, object_key=path)
 
     prefix = path + "/" if path else ""
 
@@ -1107,9 +1210,10 @@ def list_objects_recursive_for_role(
 
     Note: `prefix` is used verbatim (no trailing slash injection); pass
     "logs/2026/" to scope to that subtree, "" to scan from bucket root.
+    Callers that accept user input (MCP) must run ``validate_storage_access``
+    on the RAW path before stripping a leading slash into this argument.
     """
-    _validate_bucket_access(role, bucket, user_dict)
-    validated_role = validate_role_access(role, user_dict)
+    validated_role = validate_storage_access(role, bucket, user_dict, object_key=prefix)
 
     # S3's hard limit per ListObjectsV2 call is 1000; for larger pages, paginate.
     # The safety ceiling on a single call comes from the caller (config-driven
@@ -1252,6 +1356,7 @@ def summarize_bucket_for_role(
         role: Role name (validated against user_dict).
         bucket: Bucket name (validated against the role's allowed_buckets).
         prefix: Normalized S3 prefix ("" for bucket root, otherwise "sub/path/").
+            MCP must ACL-check the RAW user path before normalizing into this.
         user_dict: Authenticated user dict ({username, is_admin, allowed_roles}).
         max_keys: Walk cap (config: mcp_summary_max_keys). Floor: 1000.
         prefix_scan_pages: Step-1 page budget (config: mcp_summary_prefix_scan_pages).
@@ -1259,8 +1364,7 @@ def summarize_bucket_for_role(
 
     Raises PermissionError on role/bucket access violation.
     """
-    _validate_bucket_access(role, bucket, user_dict)
-    validated_role = validate_role_access(role, user_dict)
+    validated_role = validate_storage_access(role, bucket, user_dict, object_key=prefix)
 
     # Server-side floors: a pathological config value (0, negative) cannot
     # disable the walk or the prefix scan entirely.
@@ -1527,8 +1631,7 @@ def list_objects_paginated_for_role(
             "has_more":    bool,
         }
     """
-    _validate_bucket_access(role, bucket, user_dict)
-    validated_role = validate_role_access(role, user_dict)
+    validated_role = validate_storage_access(role, bucket, user_dict, object_key=path)
 
     # Defensive clamp — route already validates 1..1000 via FastAPI Query
     # constraints, but the helper is called directly from tests too.
@@ -1645,8 +1748,7 @@ def list_objects_client_load_for_role(
             "next_token":  str | None,
         }
     """
-    _validate_bucket_access(role, bucket, user_dict)
-    validated_role = validate_role_access(role, user_dict)
+    validated_role = validate_storage_access(role, bucket, user_dict, object_key=path)
 
     # Defensive clamp. 1..200000 — high enough for the 595k-folder "Load all"
     # case to drain in a handful of chunks, low enough to refuse absurd values.
@@ -1755,8 +1857,7 @@ def head_object_for_role(role: str, bucket: str, path: str, user_dict: Dict[str,
     """
     from botocore.exceptions import ClientError as _ClientError
 
-    _validate_bucket_access(role, bucket, user_dict)
-    validated_role = validate_role_access(role, user_dict)
+    validated_role = validate_storage_access(role, bucket, user_dict, object_key=path)
 
     def do_head(s3_client):
         try:
@@ -1784,8 +1885,7 @@ def get_object_metadata_for_role(role: str, bucket: str, path: str, user_dict: D
     """
     from botocore.exceptions import ClientError as _ClientError
 
-    _validate_bucket_access(role, bucket, user_dict)
-    validated_role = validate_role_access(role, user_dict)
+    validated_role = validate_storage_access(role, bucket, user_dict, object_key=path)
 
     def do_head(s3_client):
         try:
@@ -1818,8 +1918,7 @@ def read_object_for_role(role: str, bucket: str, path: str, user_dict: Dict[str,
 
     from another_s3_manager.metrics import s3_bytes_total, safe_role_label
 
-    _validate_bucket_access(role, bucket, user_dict)
-    validated_role = validate_role_access(role, user_dict)
+    validated_role = validate_storage_access(role, bucket, user_dict, object_key=path)
 
     def do_get(s3_client):
         try:
@@ -1864,8 +1963,7 @@ def iter_object_for_role(
 
     from another_s3_manager.metrics import s3_bytes_total, safe_role_label
 
-    _validate_bucket_access(role, bucket, user_dict)
-    validated_role = validate_role_access(role, user_dict)
+    validated_role = validate_storage_access(role, bucket, user_dict, object_key=path)
 
     def do_fetch(s3_client):
         try:
@@ -1920,8 +2018,7 @@ def read_object_range_for_role(
 
     from another_s3_manager.metrics import s3_bytes_total, safe_role_label
 
-    _validate_bucket_access(role, bucket, user_dict)
-    validated_role = validate_role_access(role, user_dict)
+    validated_role = validate_storage_access(role, bucket, user_dict, object_key=path)
 
     def do_get_range(s3_client):
         try:
@@ -2016,8 +2113,7 @@ def generate_presigned_url_for_role(
 
     Raises PermissionError on role/bucket access violation.
     """
-    _validate_bucket_access(role, bucket, user_dict)
-    validated_role = validate_role_access(role, user_dict)
+    validated_role = validate_storage_access(role, bucket, user_dict, object_key=path)
 
     params: Dict[str, Any] = {"Bucket": bucket, "Key": path}
     utf8_content_type = _utf8_text_content_type_for(path)
@@ -2060,8 +2156,7 @@ def put_object_for_role(
     """
     from another_s3_manager.metrics import s3_bytes_total, s3_objects_total, safe_role_label
 
-    _validate_bucket_access(role, bucket, user_dict)
-    validated_role = validate_role_access(role, user_dict)
+    validated_role = validate_storage_access(role, bucket, user_dict, object_key=path)
 
     def do_put(s3_client):
         put_params: Dict[str, Any] = {
@@ -2112,8 +2207,7 @@ def upload_fileobj_for_role(
     """
     from another_s3_manager.metrics import s3_bytes_total, s3_objects_total, safe_role_label
 
-    _validate_bucket_access(role, bucket, user_dict)
-    validated_role = validate_role_access(role, user_dict)
+    validated_role = validate_storage_access(role, bucket, user_dict, object_key=path)
 
     def do_put(s3_client):
         # execute_with_s3_retry may invoke this callback a SECOND time after a
@@ -2159,8 +2253,8 @@ def copy_object_for_role(
 
     # Validate BOTH buckets — a role scoped to specific allowed_buckets must be
     # allowed to write the destination, not just read the source.
-    _validate_bucket_access(role, source_bucket, user_dict)
-    _validate_bucket_access(role, dest_bucket, user_dict)
+    validate_storage_access(role, source_bucket, user_dict, object_key=source_path)
+    validate_storage_access(role, dest_bucket, user_dict, object_key=dest_path)
     validated_role = validate_role_access(role, user_dict)
 
     def do_copy(s3_client):
@@ -2202,8 +2296,7 @@ def delete_object_for_role(role: str, bucket: str, path: str, user_dict: Dict[st
     """
     from another_s3_manager.metrics import s3_objects_total, safe_role_label
 
-    _validate_bucket_access(role, bucket, user_dict)
-    validated_role = validate_role_access(role, user_dict)
+    validated_role = validate_storage_access(role, bucket, user_dict, object_key=path)
 
     is_directory = path.endswith("/")
     prefix = path.rstrip("/")

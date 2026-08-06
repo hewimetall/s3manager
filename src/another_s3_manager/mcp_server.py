@@ -138,6 +138,40 @@ class McpError(Exception):
         return " ".join([f"{self.code}: {message}", *suffix])
 
 
+def raise_storage_permission_mcp(
+    exc: BaseException,
+    *,
+    role: str,
+    user: dict,
+    bucket: str | None = None,
+    extra: dict | None = None,
+) -> None:
+    """Map PermissionError / RoleNotFoundError from validate_storage_access to McpError.
+
+    Same classification for every MCP tool — prefix denials must not become ROLE_NOT_ALLOWED.
+    """
+    msg = str(exc)
+    lower = msg.lower()
+    details = dict(extra or {})
+    if (
+        "allowed_prefixes" in lower
+        or "prefix access denied" in lower
+        or "path traversal" in lower
+        or "invalid path" in lower
+        or "uri keys" in lower
+    ):
+        if bucket is not None:
+            details.setdefault("bucket", bucket)
+        raise McpError("PREFIX_NOT_ALLOWED", msg, details) from exc
+    if "bucket" in lower:
+        if bucket is not None:
+            details.setdefault("bucket", bucket)
+        raise McpError("BUCKET_NOT_ALLOWED", msg, details) from exc
+    details.setdefault("role", role)
+    details.setdefault("allowed_roles", user.get("allowed_roles", []))
+    raise McpError("ROLE_NOT_ALLOWED", msg, details) from exc
+
+
 # ---------------------------------------------------------------------------
 # Write-gate
 # ---------------------------------------------------------------------------
@@ -610,11 +644,7 @@ async def list_buckets(role: RoleParam) -> dict:
         try:
             buckets = await run_in_threadpool(_s3_client.list_buckets_for_role, role, user)
         except (PermissionError, RoleNotFoundError) as e:
-            raise McpError(
-                "ROLE_NOT_ALLOWED",
-                str(e),
-                {"role": role, "allowed_roles": user["allowed_roles"]},
-            )
+            raise_storage_permission_mcp(e, role=role, user=user)
         logger.info("mcp.list_buckets", extra={"user": user["username"], "role": role, "count": len(buckets)})
         return _observe_response_size("list_buckets", token, {"buckets": buckets})
     except McpError as e:
@@ -780,8 +810,8 @@ async def list_files(
             # keeps both modes consistent instead of only fixing one.
             effective_max_keys = max(1, min(max_keys if max_keys is not None else page_size, ceiling))
             if recursive:
-                # Normalize path → S3 prefix (no leading slash; trailing slash
-                # only if non-empty so we don't accidentally match other names).
+                # ACL on RAW path first — stripping "/stand-x/" must not mint access.
+                _s3_client.validate_storage_access(role, bucket, user, object_key=path)
                 prefix = path.strip("/")
                 if prefix:
                     prefix += "/"
@@ -821,9 +851,12 @@ async def list_files(
                 # nothing. bucket_summary's own path description shows the
                 # trailing-slash form, so this tool was steering agents
                 # straight into it. The recursive branch already normalizes
-                # via path.strip("/") above; mirror that here.
+                # ACL on RAW path first, then strip for the listing helper.
+                _s3_client.validate_storage_access(role, bucket, user, object_key=path)
                 normalized_path = path.strip("/")
-                files = await run_in_threadpool(_s3_client.list_objects_for_role, role, bucket, normalized_path, user)
+                files = await run_in_threadpool(
+                    _s3_client.list_objects_for_role, role, bucket, normalized_path, user
+                )
                 result = {"files": files}
                 if len(files) > effective_max_keys:
                     result["files"] = files[:effective_max_keys]
@@ -836,10 +869,7 @@ async def list_files(
                         "every key."
                     )
         except (PermissionError, RoleNotFoundError) as e:
-            msg = str(e).lower()
-            if "bucket" in msg:
-                raise McpError("BUCKET_NOT_ALLOWED", str(e), {"bucket": bucket})
-            raise McpError("ROLE_NOT_ALLOWED", str(e), {"role": role, "allowed_roles": user["allowed_roles"]})
+            raise_storage_permission_mcp(e, role=role, user=user, bucket=bucket)
         logger.info(
             "mcp.list_files",
             extra={
@@ -936,7 +966,8 @@ async def bucket_summary(
         config = _config_module.load_config(force_reload=False)
         max_keys = int(config.get("mcp_summary_max_keys", 50_000))
         prefix_scan_pages = int(config.get("mcp_summary_prefix_scan_pages", 20))
-        # Normalize path → S3 prefix, exactly like list_files recursive mode.
+        # ACL on RAW path first — stripping must not mint access to a foreign prefix.
+        _s3_client.validate_storage_access(role, bucket, user, object_key=path)
         prefix = path.strip("/")
         if prefix:
             prefix += "/"
@@ -951,10 +982,7 @@ async def bucket_summary(
                 prefix_scan_pages=prefix_scan_pages,
             )
         except (PermissionError, RoleNotFoundError) as e:
-            msg = str(e).lower()
-            if "bucket" in msg:
-                raise McpError("BUCKET_NOT_ALLOWED", str(e), {"bucket": bucket})
-            raise McpError("ROLE_NOT_ALLOWED", str(e), {"role": role, "allowed_roles": user["allowed_roles"]})
+            raise_storage_permission_mcp(e, role=role, user=user, bucket=bucket)
         logger.info(
             "mcp.bucket_summary",
             extra={
@@ -1110,10 +1138,7 @@ async def upload_file(
         try:
             await run_in_threadpool(_s3_client.put_object_for_role, role, bucket, path, content, user)
         except (PermissionError, RoleNotFoundError) as e:
-            msg = str(e).lower()
-            if "bucket" in msg:
-                raise McpError("BUCKET_NOT_ALLOWED", str(e), {"bucket": bucket})
-            raise McpError("ROLE_NOT_ALLOWED", str(e), {"role": role, "allowed_roles": user["allowed_roles"]})
+            raise_storage_permission_mcp(e, role=role, user=user, bucket=bucket)
         logger.info(
             "mcp.upload_file",
             extra={"user": user["username"], "role": role, "bucket": bucket, "path": path, "size": len(content)},
@@ -1201,10 +1226,7 @@ async def delete_file(
         except FileNotFoundError:
             raise McpError("FILE_NOT_FOUND", "Object not found", {"bucket": bucket, "path": path})
         except (PermissionError, RoleNotFoundError) as e:
-            msg = str(e).lower()
-            if "bucket" in msg:
-                raise McpError("BUCKET_NOT_ALLOWED", str(e), {"bucket": bucket})
-            raise McpError("ROLE_NOT_ALLOWED", str(e), {"role": role, "allowed_roles": user["allowed_roles"]})
+            raise_storage_permission_mcp(e, role=role, user=user, bucket=bucket)
         logger.info(
             "mcp.delete_file",
             extra={"user": user["username"], "role": role, "bucket": bucket, "path": path},
@@ -1302,9 +1324,7 @@ async def read_file(
         except FileNotFoundError:
             raise McpError("FILE_NOT_FOUND", "Object not found", {"bucket": bucket, "path": path})
         except (PermissionError, RoleNotFoundError) as e:
-            if "bucket" in str(e).lower():
-                raise McpError("BUCKET_NOT_ALLOWED", str(e), {"bucket": bucket})
-            raise McpError("ROLE_NOT_ALLOWED", str(e), {"role": role, "allowed_roles": user["allowed_roles"]})
+            raise_storage_permission_mcp(e, role=role, user=user, bucket=bucket)
 
         if size > effective_max:
             mcp_reads_refused_total.labels(tool="read_file", reason="file_too_large").inc()
@@ -1528,13 +1548,12 @@ async def copy_object(
         except FileNotFoundError as e:
             raise McpError("FILE_NOT_FOUND", str(e), {"bucket": source_bucket, "path": source_path})
         except (PermissionError, RoleNotFoundError) as e:
-            if "bucket" in str(e).lower():
-                raise McpError(
-                    "BUCKET_NOT_ALLOWED",
-                    str(e),
-                    {"source_bucket": source_bucket, "dest_bucket": dest_bucket},
-                )
-            raise McpError("ROLE_NOT_ALLOWED", str(e), {"role": role, "allowed_roles": user["allowed_roles"]})
+            raise_storage_permission_mcp(
+                e,
+                role=role,
+                user=user,
+                extra={"source_bucket": source_bucket, "dest_bucket": dest_bucket},
+            )
         logger.info(
             "mcp.copy_object",
             extra={
@@ -1621,9 +1640,7 @@ async def get_object_metadata(
         except FileNotFoundError:
             raise McpError("FILE_NOT_FOUND", "Object not found", {"bucket": bucket, "path": path})
         except (PermissionError, RoleNotFoundError) as e:
-            if "bucket" in str(e).lower():
-                raise McpError("BUCKET_NOT_ALLOWED", str(e), {"bucket": bucket})
-            raise McpError("ROLE_NOT_ALLOWED", str(e), {"role": role, "allowed_roles": user["allowed_roles"]})
+            raise_storage_permission_mcp(e, role=role, user=user, bucket=bucket)
         logger.info(
             "mcp.get_object_metadata",
             extra={"user": user["username"], "role": role, "bucket": bucket, "path": path},
@@ -1705,9 +1722,7 @@ async def presigned_url(
                 _s3_client.generate_presigned_url_for_role, role, bucket, path, user, expires_in=clamped
             )
         except (PermissionError, RoleNotFoundError) as e:
-            if "bucket" in str(e).lower():
-                raise McpError("BUCKET_NOT_ALLOWED", str(e), {"bucket": bucket})
-            raise McpError("ROLE_NOT_ALLOWED", str(e), {"role": role, "allowed_roles": user["allowed_roles"]})
+            raise_storage_permission_mcp(e, role=role, user=user, bucket=bucket)
         expires_at = (datetime.now(timezone.utc) + timedelta(seconds=clamped)).isoformat()
         logger.info(
             "mcp.presigned_url",
