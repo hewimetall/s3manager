@@ -83,6 +83,7 @@ from another_s3_manager.s3_client import (
     list_objects_client_load_for_role,
     list_objects_for_role,
     list_objects_paginated_for_role,
+    prepare_list_path,
     role_uses_temporary_credentials,
     upload_fileobj_for_role,
 )
@@ -1299,8 +1300,21 @@ async def list_files(
             return page
 
         if max_keys is None:
-            files = await run_in_threadpool(list_objects_for_role, role, bucket_name, path, current_user)
-            return {"files": files, "path": path, "total_count": len(files)}
+            # Resolve prefix entry before listing so the response `path` echoes
+            # the effective prefix (SPA redirects empty → single allowed prefix).
+            effective_path, virtual_dirs, _ = prepare_list_path(
+                role, bucket_name, current_user, path
+            )
+            if virtual_dirs is not None:
+                return {
+                    "files": virtual_dirs,
+                    "path": effective_path,
+                    "total_count": len(virtual_dirs),
+                }
+            files = await run_in_threadpool(
+                list_objects_for_role, role, bucket_name, effective_path, current_user
+            )
+            return {"files": files, "path": effective_path, "total_count": len(files)}
 
         page = await run_in_threadpool(
             list_objects_paginated_for_role,

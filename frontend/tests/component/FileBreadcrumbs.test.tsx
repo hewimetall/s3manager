@@ -1,16 +1,22 @@
 import { describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { FileBreadcrumbs } from "@/components/FileBrowser/FileBreadcrumbs";
 
 function renderCrumbs(path: string) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   return render(
-    <MantineProvider>
-      <MemoryRouter>
-        <FileBreadcrumbs bucket="my-bucket" roleId="aws-prod" path={path} />
-      </MemoryRouter>
-    </MantineProvider>,
+    <QueryClientProvider client={client}>
+      <MantineProvider>
+        <MemoryRouter>
+          <FileBreadcrumbs bucket="my-bucket" roleId="aws-prod" path={path} />
+        </MemoryRouter>
+      </MantineProvider>
+    </QueryClientProvider>,
   );
 }
 

@@ -46,3 +46,30 @@ export function splitCrumbs(path: string): Crumb[] {
     path: segments.slice(0, i + 1).join("/"),
   }));
 }
+
+/** Normalize an allowed_prefixes entry to the SPA path form (no trailing slash). */
+export function prefixToPath(prefix: string): string {
+  return prefix.replace(/^\/+|\/+$/g, "");
+}
+
+/**
+ * Lowest path the role may treat as "home" inside a bucket.
+ * - one allowed_prefix → that prefix
+ * - several / none → "" (bucket URL; server synthesizes multi-prefix folders)
+ */
+export function roleEntryPath(allowedPrefixes: string[] | undefined): string {
+  if (!allowedPrefixes || allowedPrefixes.length !== 1) return "";
+  return prefixToPath(allowedPrefixes[0]!);
+}
+
+/**
+ * Clamp a breadcrumb / up navigation so it never climbs above the role's
+ * single allowed prefix. Multi-prefix and legacy roles are unconstrained
+ * (server still enforces ACL).
+ */
+export function clampPathToEntry(path: string, entryPath: string): string {
+  if (!entryPath) return path;
+  if (!path) return entryPath;
+  if (path === entryPath || path.startsWith(entryPath + "/")) return path;
+  return entryPath;
+}

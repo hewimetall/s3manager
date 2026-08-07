@@ -77,6 +77,10 @@ export interface ClientLoadPage {
   files: FileEntry[];
   truncated: boolean;
   next_token: string | null;
+  /** Effective list path. When the role has a single allowed_prefix and the
+   *  request path was empty, the server substitutes that prefix here so the
+   *  SPA can replace the URL instead of treating bucket-root as the location. */
+  path?: string;
 }
 
 export interface Ban {
@@ -128,6 +132,8 @@ export interface AppRole {
   verify_ssl?: boolean;
   addressing_style?: "auto" | "virtual" | "path";
   allowed_buckets?: string[];
+  /** When set, the role may only touch keys under these prefixes (segment-boundary). */
+  allowed_prefixes?: string[];
 }
 
 export interface PasswordPolicy {

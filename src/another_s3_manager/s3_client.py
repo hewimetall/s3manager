@@ -999,6 +999,80 @@ def role_allowed_prefixes(role_config: Dict[str, Any]) -> Optional[list]:
     return prefixes
 
 
+def _prefix_as_list_path(raw: str) -> str:
+    """Normalize an allowed_prefixes entry to the path form used by list helpers.
+
+    ``stand-dayna/`` and ``stand-dayna`` both become ``stand-dayna`` (no leading
+    or trailing slash) — the same shape ``sanitize_path`` returns.
+    """
+    return (raw or "").strip().strip("/")
+
+
+def prepare_list_path(
+    role: Optional[str],
+    bucket: str,
+    user_dict: Dict[str, Any],
+    path: str,
+) -> tuple[str, Optional[list], str]:
+    """LIST-only entry resolution for roles with ``allowed_prefixes``.
+
+    Returns ``(effective_path, virtual_directories, validated_role)``.
+
+    When ``path`` is empty and the role has exactly one allowed prefix, the
+    prefix is substituted so clients (SPA, MCP, curl) land inside their tree
+    instead of being denied at the shared-bucket root.
+
+    When ``path`` is empty and the role has several allowed prefixes,
+    ``virtual_directories`` is a synthetic folder list (one entry per prefix)
+    and the caller must NOT call S3 ListObjects on the bucket root.
+
+    Critical invariant: this does **not** teach ``validate_storage_access`` that
+    an empty key is allowed. Download / upload / delete / head still deny
+    ``object_key=""`` under a prefix-scoped role. Empty path never means root
+    access when ``allowed_prefixes`` is set.
+    """
+    validated_role = validate_role_access(role, user_dict)
+
+    from another_s3_manager.config import load_config
+
+    config = load_config(force_reload=False)
+    roles = config.get("roles", [])
+    role_config = next((r for r in roles if r.get("name") == validated_role), None)
+    if role_config is None:
+        return path, None, validated_role
+
+    allowed_buckets = role_allowed_buckets(role_config, config)
+    if allowed_buckets is not None and bucket not in allowed_buckets:
+        raise PermissionError(f"bucket '{bucket}' not in allowed_buckets for role '{validated_role}'")
+
+    prefixes = role_allowed_prefixes(role_config)
+    if prefixes is None:
+        # Legacy bucket-only role: empty path lists the real root.
+        return path, None, validated_role
+
+    norms = [_prefix_as_list_path(p) for p in prefixes if isinstance(p, str) and _prefix_as_list_path(p)]
+    # Preserve fail-closed empty list: fall through to validate_storage_access.
+    if path == "":
+        if not norms:
+            validate_storage_access(validated_role, bucket, user_dict, object_key="")
+            # validate always raises for empty key + empty prefixes; keep mypy happy
+            raise PermissionError(
+                f"prefix access denied: key '' not under allowed_prefixes for role '{validated_role}'"
+            )
+        if len(norms) == 1:
+            effective = norms[0]
+            validate_storage_access(validated_role, bucket, user_dict, object_key=effective)
+            return effective, None, validated_role
+        virtual = [
+            {"name": name, "is_directory": True, "size": 0}
+            for name in sorted(set(norms), key=str.lower)
+        ]
+        return "", virtual, validated_role
+
+    validate_storage_access(validated_role, bucket, user_dict, object_key=path)
+    return path, None, validated_role
+
+
 def normalize_access_key(raw: Optional[str]) -> str:
     """Normalize an S3 key/path for ACL checks. Rejects traversal and absolute forms."""
     if raw is None or raw == "":
@@ -1147,8 +1221,13 @@ def list_objects_for_role(role: str, bucket: str, path: str, user_dict: Dict[str
 
     Returns list of file-object dicts (same shape as /api/buckets/{b}/files).
     Raises PermissionError on role/bucket access violation.
+
+    Empty ``path`` under a prefix-scoped role resolves via ``prepare_list_path``
+    (single prefix substituted; multiple prefixes returned as virtual folders).
     """
-    validated_role = validate_storage_access(role, bucket, user_dict, object_key=path)
+    path, virtual_dirs, validated_role = prepare_list_path(role, bucket, user_dict, path)
+    if virtual_dirs is not None:
+        return sorted(virtual_dirs, key=lambda x: (not x["is_directory"], x["name"].lower()))
 
     prefix = path + "/" if path else ""
 
@@ -1213,10 +1292,27 @@ def list_objects_recursive_for_role(
 
     Note: `prefix` is used verbatim (no trailing slash injection); pass
     "logs/2026/" to scope to that subtree, "" to scan from bucket root.
-    Callers that accept user input (MCP) must run ``validate_storage_access``
-    on the RAW path before stripping a leading slash into this argument.
+    Callers that accept user input (MCP) must ACL-check the RAW path before
+    stripping a leading slash into this argument. Empty ``prefix`` under a
+    prefix-scoped role is resolved via ``prepare_list_path`` (same door as
+    non-recursive list) so agents are not denied at the shared-bucket root.
     """
-    validated_role = validate_storage_access(role, bucket, user_dict, object_key=prefix)
+    list_path = prefix.rstrip("/") if prefix else ""
+    list_path, virtual_dirs, validated_role = prepare_list_path(role, bucket, user_dict, list_path)
+    if virtual_dirs is not None:
+        return {
+            "files": [
+                {"key": f"{d['name']}/", "size": 0, "last_modified": None} for d in virtual_dirs
+            ],
+            "is_truncated": False,
+            "next_continuation_token": None,
+            "key_count": len(virtual_dirs),
+            "hint": (
+                "This role has multiple allowed_prefixes; pass path=<prefix>/ "
+                "to list one of them recursively."
+            ),
+        }
+    prefix = f"{list_path}/" if list_path else ""
 
     # S3's hard limit per ListObjectsV2 call is 1000; for larger pages, paginate.
     # The safety ceiling on a single call comes from the caller (config-driven
@@ -1367,7 +1463,41 @@ def summarize_bucket_for_role(
 
     Raises PermissionError on role/bucket access violation.
     """
-    validated_role = validate_storage_access(role, bucket, user_dict, object_key=prefix)
+    # Summary of "" under a prefix-scoped role must land in the role's tree,
+    # not the shared-bucket root (same door as list_objects_*).
+    list_path = prefix.rstrip("/") if prefix else ""
+    list_path, virtual_dirs, validated_role = prepare_list_path(role, bucket, user_dict, list_path)
+    if virtual_dirs is not None:
+        # Multi-prefix role asking for bucket root: return the synthetic folder
+        # set as prefixes with zero walk stats — never scan the real root.
+        return {
+            "prefix": "",
+            "complete": True,
+            "prefix_list_complete": True,
+            "total_objects": None,
+            "total_bytes": None,
+            "root_objects": 0,
+            "prefixes": [
+                {
+                    "prefix": f"{d['name']}/",
+                    "objects": None,
+                    "bytes": None,
+                    "coverage": "not_scanned",
+                }
+                for d in virtual_dirs
+            ],
+            "extensions": [],
+            "extensions_truncated": False,
+            "largest_objects": [],
+            "oldest_modified": None,
+            "newest_modified": None,
+            "scan_stopped_at": None,
+            "note": (
+                "This role has multiple allowed_prefixes; pass path=<prefix>/ "
+                "to summarize one of them."
+            ),
+        }
+    prefix = list_path + "/" if list_path else ""
 
     # Server-side floors: a pathological config value (0, negative) cannot
     # disable the walk or the prefix scan entirely.
@@ -1632,9 +1762,18 @@ def list_objects_paginated_for_role(
             "files":       [{name, is_directory, size, last_modified}, ...],
             "next_token":  str | None,
             "has_more":    bool,
+            "path":        str,  # effective path (may differ from request when prefix entry resolved)
         }
     """
-    validated_role = validate_storage_access(role, bucket, user_dict, object_key=path)
+    path, virtual_dirs, validated_role = prepare_list_path(role, bucket, user_dict, path)
+    if virtual_dirs is not None:
+        return {
+            "directories": virtual_dirs,
+            "files": [],
+            "next_token": None,
+            "has_more": False,
+            "path": path,
+        }
 
     # Defensive clamp — route already validates 1..1000 via FastAPI Query
     # constraints, but the helper is called directly from tests too.
@@ -1704,6 +1843,7 @@ def list_objects_paginated_for_role(
             "files": files,
             "next_token": next_token,
             "has_more": is_truncated,
+            "path": path,
         }
 
     return execute_with_s3_retry(validated_role, "list", fetch)
@@ -1749,9 +1889,18 @@ def list_objects_client_load_for_role(
             "files":       [...],   # this chunk's files
             "truncated":   bool,    # True if S3 has more beyond this chunk
             "next_token":  str | None,
+            "path":        str,     # effective path (prefix entry may rewrite "")
         }
     """
-    validated_role = validate_storage_access(role, bucket, user_dict, object_key=path)
+    path, virtual_dirs, validated_role = prepare_list_path(role, bucket, user_dict, path)
+    if virtual_dirs is not None:
+        return {
+            "directories": virtual_dirs,
+            "files": [],
+            "truncated": False,
+            "next_token": None,
+            "path": path,
+        }
 
     # Defensive clamp. 1..200000 — high enough for the 595k-folder "Load all"
     # case to drain in a handful of chunks, low enough to refuse absurd values.
@@ -1846,6 +1995,7 @@ def list_objects_client_load_for_role(
             "files": files,
             "truncated": truncated,
             "next_token": next_token,
+            "path": path,
         }
 
     return execute_with_s3_retry(validated_role, "list", fetch)

@@ -22,7 +22,7 @@ import {
 import { useMe } from "@/features/auth/hooks/useMe";
 import { useDisplayMode } from "@/hooks/useDisplayMode";
 import { useConfig } from "@/hooks/useConfig";
-import { joinPath, decodePath } from "@/utils/pathUtils";
+import { joinPath, decodePath, encodePath } from "@/utils/pathUtils";
 import { ApiError, getErrorMessage } from "@/utils/apiError";
 import { formatBytes } from "@/utils/formatBytes";
 import { formatTimeOfDay } from "@/utils/formatDate";
@@ -95,6 +95,21 @@ export function FileBrowser() {
   const folder = useFiles(bucket, roleId, pathFromUrl);
   const search = useFileSearch(bucket, roleId, pathFromUrl, serverSearchTerm ?? "");
   const active = serverSearchActive ? search : folder;
+
+  // Server rewrote empty path → single allowed_prefix. Replace the URL so
+  // subsequent folder clicks join under the real prefix (otherwise "sprites"
+  // would navigate to /p/sprites and get 403).
+  useEffect(() => {
+    if (pathFromUrl !== "") return;
+    if (serverSearchActive) return;
+    const pages = folder.data?.pages;
+    const effective = pages?.[0]?.path;
+    if (!effective) return;
+    navigate(
+      `/r/${encodeURIComponent(roleId)}/b/${encodeURIComponent(bucket)}/p/${encodePath(effective)}`,
+      { replace: true },
+    );
+  }, [pathFromUrl, serverSearchActive, folder.data, roleId, bucket, navigate]);
 
   const {
     directories,

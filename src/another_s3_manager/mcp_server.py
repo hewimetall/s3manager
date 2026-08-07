@@ -810,8 +810,11 @@ async def list_files(
             # keeps both modes consistent instead of only fixing one.
             effective_max_keys = max(1, min(max_keys if max_keys is not None else page_size, ceiling))
             if recursive:
-                # ACL on RAW path first — stripping "/stand-x/" must not mint access.
-                _s3_client.validate_storage_access(role, bucket, user, object_key=path)
+                # ACL on RAW path first when non-empty — stripping "/stand-x/"
+                # must not mint access. Empty path is resolved inside the list
+                # helper (single allowed_prefix substituted; multi → virtual).
+                if path != "":
+                    _s3_client.validate_storage_access(role, bucket, user, object_key=path)
                 prefix = path.strip("/")
                 if prefix:
                     prefix += "/"
@@ -850,9 +853,11 @@ async def list_files(
                 # and S3 silently returned an empty listing — no error, just
                 # nothing. bucket_summary's own path description shows the
                 # trailing-slash form, so this tool was steering agents
-                # straight into it. The recursive branch already normalizes
-                # ACL on RAW path first, then strip for the listing helper.
-                _s3_client.validate_storage_access(role, bucket, user, object_key=path)
+                # straight into it.
+                # ACL on RAW path when non-empty (absolute / traversal / foreign
+                # prefix). Empty path resolves inside list_objects_for_role.
+                if path != "":
+                    _s3_client.validate_storage_access(role, bucket, user, object_key=path)
                 normalized_path = path.strip("/")
                 files = await run_in_threadpool(
                     _s3_client.list_objects_for_role, role, bucket, normalized_path, user
@@ -967,8 +972,10 @@ async def bucket_summary(
         max_keys = int(config.get("mcp_summary_max_keys", 50_000))
         prefix_scan_pages = int(config.get("mcp_summary_prefix_scan_pages", 20))
         try:
-            # ACL on RAW path first — stripping must not mint access to a foreign prefix.
-            _s3_client.validate_storage_access(role, bucket, user, object_key=path)
+            # ACL on RAW path when non-empty — stripping must not mint access.
+            # Empty path resolves inside summarize_bucket_for_role (prefix entry).
+            if path != "":
+                _s3_client.validate_storage_access(role, bucket, user, object_key=path)
             prefix = path.strip("/")
             if prefix:
                 prefix += "/"

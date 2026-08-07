@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { encodePath, decodePath, joinPath, parentPath, splitCrumbs } from "@/utils/pathUtils";
+import {
+  encodePath,
+  decodePath,
+  joinPath,
+  parentPath,
+  splitCrumbs,
+  prefixToPath,
+  roleEntryPath,
+  clampPathToEntry,
+} from "@/utils/pathUtils";
 
 describe("encodePath / decodePath", () => {
   it("roundtrips simple paths", () => {
@@ -68,5 +77,27 @@ describe("splitCrumbs", () => {
 
   it("returns empty array for empty path", () => {
     expect(splitCrumbs("")).toEqual([]);
+  });
+});
+
+describe("prefix entry helpers", () => {
+  it("prefixToPath strips slashes", () => {
+    expect(prefixToPath("stand-dayna/")).toBe("stand-dayna");
+    expect(prefixToPath("/stand-dayna/")).toBe("stand-dayna");
+  });
+
+  it("roleEntryPath only for a single prefix", () => {
+    expect(roleEntryPath(["stand-dayna/"])).toBe("stand-dayna");
+    expect(roleEntryPath(["a/", "b/"])).toBe("");
+    expect(roleEntryPath(undefined)).toBe("");
+  });
+
+  it("clampPathToEntry never climbs above the entry prefix", () => {
+    expect(clampPathToEntry("", "stand-dayna")).toBe("stand-dayna");
+    expect(clampPathToEntry("stand-dayna/sprites", "stand-dayna")).toBe(
+      "stand-dayna/sprites",
+    );
+    expect(clampPathToEntry("other", "stand-dayna")).toBe("stand-dayna");
+    expect(clampPathToEntry("stand-dayna-evil", "stand-dayna")).toBe("stand-dayna");
   });
 });

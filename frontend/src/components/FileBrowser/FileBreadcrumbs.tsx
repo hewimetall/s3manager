@@ -1,7 +1,8 @@
 import { Anchor, Breadcrumbs, Text } from "@mantine/core";
 import { Link } from "react-router-dom";
 import { Home } from "lucide-react";
-import { splitCrumbs } from "@/utils/pathUtils";
+import { splitCrumbs, roleEntryPath, clampPathToEntry, encodePath } from "@/utils/pathUtils";
+import { useConfig } from "@/hooks/useConfig";
 import classes from "./FileBrowser.module.css";
 
 interface FileBreadcrumbsProps {
@@ -11,8 +12,20 @@ interface FileBreadcrumbsProps {
 }
 
 export function FileBreadcrumbs({ bucket, roleId, path }: FileBreadcrumbsProps) {
-  const crumbs = splitCrumbs(path);
+  const { data: config } = useConfig();
+  const role = config?.roles?.find((r) => r.name === roleId);
+  const entryPath = roleEntryPath(role?.allowed_prefixes);
+  const crumbs = splitCrumbs(path).filter((c) => {
+    // Hide crumb segments above the role's single allowed prefix so "Up" /
+    // intermediate links cannot climb into the shared-bucket root.
+    if (!entryPath) return true;
+    return c.path === entryPath || c.path.startsWith(entryPath + "/");
+  });
   const baseUrl = `/r/${encodeURIComponent(roleId)}/b/${encodeURIComponent(bucket)}`;
+  const homePath = clampPathToEntry("", entryPath);
+  const homeUrl = homePath
+    ? `${baseUrl}/p/${encodePath(homePath)}`
+    : baseUrl;
 
   return (
     // wrap: on phones a deep path folds to a second line instead of
@@ -20,16 +33,18 @@ export function FileBreadcrumbs({ bucket, roleId, path }: FileBreadcrumbsProps) 
     <Breadcrumbs style={{ flexWrap: "wrap", rowGap: 4 }}>
       <Anchor
         component={Link}
-        to={baseUrl}
+        to={homeUrl}
         size="sm"
         className={classes.crumb}
-        title={bucket}
+        title={entryPath || bucket}
       >
         <Home size={14} style={{ verticalAlign: "middle", marginRight: 4 }} />
-        {bucket}
+        {entryPath || bucket}
       </Anchor>
-      {crumbs.map((c, i) => {
-        const isLast = i === crumbs.length - 1;
+      {crumbs
+        .filter((c) => !(entryPath && c.path === entryPath))
+        .map((c, i, visible) => {
+        const isLast = i === visible.length - 1;
         const url = `${baseUrl}/p/${c.path.split("/").map(encodeURIComponent).join("/")}`;
         return isLast ? (
           <Text
