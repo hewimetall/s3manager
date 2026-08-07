@@ -72,3 +72,40 @@ def test_gateway_header_auth(tmp_path, monkeypatch):
         assert admin_body["is_admin"] is True
         assert "dayana" in admin_body["allowed_roles"]
         assert "timeweb" in admin_body["allowed_roles"]
+
+        # Spaced group name must stay one token — never invent `admin`.
+        spaced = client.get(
+            "/api/me",
+            headers={
+                "x-authentik-username": "akadmin",
+                "x-authentik-groups": "authentik Admins|dayna|owner",
+            },
+        )
+        assert spaced.status_code == 200
+        spaced_body = spaced.json()
+        assert spaced_body["is_admin"] is False
+        assert "dayana" not in spaced_body["allowed_roles"]
+        assert spaced_body["allowed_roles"] == []
+
+        foreign = client.get(
+            "/api/buckets",
+            params={"role": "dayana"},
+            headers={
+                "x-authentik-username": "akadmin",
+                "x-authentik-groups": "authentik Admins|dayna|owner",
+            },
+        )
+        assert foreign.status_code == 403
+
+
+def test_parse_authentik_groups_preserves_spaces():
+    from another_s3_manager.auth import parse_authentik_groups, ADMIN_GROUP
+
+    assert parse_authentik_groups("authentik Admins|dayna") == [
+        "authentik Admins",
+        "dayna",
+    ]
+    assert ADMIN_GROUP not in parse_authentik_groups("authentik Admins|dayna")
+    assert "authentik" not in parse_authentik_groups("authentik Admins")
+    assert parse_authentik_groups("a b|c d") == ["a b", "c d"]
+    assert parse_authentik_groups("a;b,c|d") == ["a", "b", "c", "d"]
