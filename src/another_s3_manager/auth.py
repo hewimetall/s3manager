@@ -83,7 +83,11 @@ def get_trusted_username(request: Request) -> Optional[str]:
 
 
 def parse_authentik_groups(raw: Optional[str]) -> List[str]:
-    """Split authentik's groups header on the separators it actually uses."""
+    """Split authentik's groups header on the separators it actually uses.
+
+    Live `x-authentik-groups` is `|`-joined (also accept `,` / `;`). Whitespace
+    is never a separator — names like ``authentik Admins`` must stay one token.
+    """
     if not raw:
         return []
     groups: List[str] = []
